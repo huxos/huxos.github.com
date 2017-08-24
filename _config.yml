@@ -1,0 +1,10 @@
+name: Huxos
+url: http://huxos.me
+description: Huxos Blog
+highlighter: rouge
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+paginate: 10
+paginate_path: "blog/page:num"
