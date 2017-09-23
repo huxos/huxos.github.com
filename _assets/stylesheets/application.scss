@@ -61,6 +61,7 @@ p > code {
   font-family: "Consolas","Envy Code R","DejaVu Sans Mono","Courier New",Courier,monospace !important;
 }
 
+
 pre {
   @extend %sass-margin-bottom;
 
@@ -84,11 +85,13 @@ pre.highlight {
 
 pre > code {
   font-family: "Consolas","Envy Code R","DejaVu Sans Mono","Courier New",Courier,monospace !important;
+  line-height: 1;
 }
 
 body {
   background: #fff;
   color: #333;
+  line-height: 1.6;
   // background-image: -webkit-linear-gradient(hsla(200,100%,70%,.5) 1px, transparent 1px);
   // background-image: -moz-linear-gradient(hsla(200,100%,70%,.5) 1px, transparent 1px);
   // background-image: linear-gradient(hsla(200,100%,70%,.5) 1px, transparent 1px);
@@ -261,12 +264,17 @@ img.figure {
   margin-left: 0;
   padding-left: 0;
 
+  ol {
+    margin-left: -1.5em;
+  }
+
   li {
     @extend .cf;
     margin: 0;
     margin-bottom: $base-spacing-unit / 4;
   }
 }
+
 .posts__date {
   color: #999;
   display: block;
