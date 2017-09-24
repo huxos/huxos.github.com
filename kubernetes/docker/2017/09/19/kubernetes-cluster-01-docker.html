@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（1. docker）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/docker/2017/09/19/kubernetes-cluster-01-docker.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（1. docker）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<ol>
+  <li>
+    <p>操作系统</p>
+
+    <ul>
+      <li>
+        <p>系统选择：Ubuntu 16.04.2 LTS, 内核版本4.10.0-27-generic</p>
+      </li>
+      <li>
+        <p>安装操作系统： 尽量保持<code class="highlighter-rouge">/var/</code>是最大的分区，docker和kubernete 的数据默认保存在此分区，采用xfs文件系统。
+ 如果<code class="highlighter-rouge">/var/</code>分区较小需要改变docker启动参数指定数据所在目录，例如：<code class="highlighter-rouge">-g /home/docker</code></p>
+      </li>
+      <li>
+        <p>操作系统调优：做好操作系统基本的调优比如<code class="highlighter-rouge">内核参数调优</code>，<code class="highlighter-rouge">设置ulimit</code>，<code class="highlighter-rouge">网卡软中断绑定</code>等。</p>
+      </li>
+    </ul>
+  </li>
+  <li>
+    <p>安装docker</p>
+
+    <p>参照<a href="https://docs.docker.com/engine/installation/linux/docker-ce/ubuntu/">Docker官方</a>提供的方法安装docker-ce最新版本。</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> sudo apt-get install <span class="se">\</span>
+ apt-transport-https <span class="se">\</span>
+ ca-certificates <span class="se">\</span>
+ curl <span class="se">\</span>
+ software-properties-common
+
+ curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+
+ <span class="c">#可以使用第三方的镜像提高安装速度</span>
+ sudo add-apt-repository <span class="se">\</span>
+ <span class="s2">"deb [arch=amd64] http://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu </span><span class="se">\</span><span class="s2">
+ </span><span class="k">$(</span>lsb_release -cs<span class="k">)</span><span class="s2"> </span><span class="se">\</span><span class="s2">
+ stable"</span>
+
+ sudo apt-get update
+ sudo apt-get install docker-ce
+</code></pre>
+    </div>
+    <p>由于内核版本较新可以更改dockerd的启动参数采用overlay2驱动,<br />
+ 使用命令<code class="highlighter-rouge">sudo systemdctl edit docker</code>编辑docker的启动参数，更改之后的内容为：</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> <span class="o">[</span>Service]
+ <span class="nv">ExecStart</span><span class="o">=</span>
+ <span class="nv">ExecStart</span><span class="o">=</span>/usr/bin/dockerd -H fd:// -s overlay2
+</code></pre>
+    </div>
+  </li>
+</ol>
+
+<p>至此，宿主机docker相关环境就准备完成了。</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（1. docker） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,2354 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Huxos</title>
+    <description>Huxos Blog</description>
+    <link>http://localhost:4000</link>
+    <atom:link href="http://localhost:4000/feed.xml" rel="self" type="application/rss+xml" />
+    
+      <item>
+        <title>基于mysql存储的DNS（bind）部署方案和步骤</title>
+        <description>&lt;h4 id=&quot;bind部署的架构&quot;&gt;bind部署的架构&lt;/h4&gt;
+
+&lt;p&gt;&lt;img src=&quot;/images/bind-cluster.png&quot; alt=&quot;bind架构&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;其中master节点采用dlz的方式与使用mysql作为数据后端，slave节点通过zone transfer与master节点同步。&lt;br /&gt;
+Master不作为服务节点，Slave节点使用LVS作为负载均衡提供服务，这样可以很方便的通过对数据库的CURD操作进行dns记录的变更，同时也可以保留bind原生的性能。&lt;br /&gt;
+由于master节点的数据保存在mysql中，当数据发生变化之后无法及时感知，slave节点的数据可能会出现与mster不一致的情况。这时我们需要对salve发送notify指令来主动同步master的数据。
+可以使用&lt;a href=&quot;https://github.com/huxos/dns-notify&quot;&gt;https://github.com/huxos/dns-notify&lt;/a&gt; 来发送notify指令。&lt;/p&gt;
+
+&lt;h4 id=&quot;部署步骤&quot;&gt;部署步骤&lt;/h4&gt;
+
+&lt;p&gt;PS：部署操作系统为：&lt;code class=&quot;highlighter-rouge&quot;&gt;Centos 7&lt;/code&gt;, Bind版本为&lt;code class=&quot;highlighter-rouge&quot;&gt;9.11.0-P5&lt;/code&gt;。&lt;/p&gt;
+
+&lt;p&gt;1．编译bind支持mysql&lt;/p&gt;
+
+&lt;p&gt;安装编译依赖&lt;/p&gt;
+
+&lt;div class=&quot;language-shell highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;yum install openssl-devel mariadb-devel gcc
+ln -sf /usr/lib64/mysql/libmysqlclient.so.18 /lib64/libmysqlclient.so
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;编译bind&lt;/p&gt;
+
+&lt;div class=&quot;language-shell highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;nb&quot;&gt;cd&lt;/span&gt; /usr/src
+wget http://ftp.isc.org/isc/bind9/9.11.0-P5/bind-9.11.0-P5.tar.gz
+tar -zxf &lt;span class=&quot;nb&quot;&gt;bind&lt;/span&gt;-9.11.0-P5.tar.gz
+&lt;span class=&quot;nb&quot;&gt;cd bind&lt;/span&gt;-9.11.0-P5
+./configure --with-dlz-mysql --enable-largefile --enable-threads&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;no --prefix&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/usr/local/bind
+make
+make install
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;创建bind运行的用户&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-Shell&quot;&gt;groupadd -r -g 25 named
+useradd -r -u 25 -s /bin/nologin -d /usr/local/named -g named named
+mkdir -p /var/cache/bind/data
+chown named:named /var/cache/bind
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;2．创建数据库的表结构&lt;/p&gt;
+
+&lt;p&gt;连接上mysqi创建数据库表&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-Sql&quot;&gt;CREATE TABLE `dns_records` (
+    `zone` varchar(255) DEFAULT NULL,
+    `host` varchar(255) DEFAULT NULL,
+    `type` varchar(255) DEFAULT NULL,
+    `data` varchar(255) NOT NULL DEFAULT '',
+    `ttl` int(11) DEFAULT NULL,
+    `mx_priority` varchar(255) DEFAULT NULL,
+    `refresh` int(11) DEFAULT NULL,
+    `retry` int(11) DEFAULT NULL,
+    `expire` int(11) DEFAULT NULL,
+    `minimum` int(11) DEFAULT NULL,
+    `serial` bigint(20) DEFAULT NULL,
+    `resp_person` varchar(255) DEFAULT NULL,
+    `primary_ns` varchar(255) DEFAULT NULL,
+    KEY `zone_index` (`zone`),
+    KEY `host_index` (`host`),
+    KEY `type_index` (`type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;div class=&quot;language-sql highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;k&quot;&gt;CREATE&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;TABLE&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;`xfr_table`&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;`zone`&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;varchar&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;255&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;NOT&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;NULL&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;`client`&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;varchar&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;255&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;NOT&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;NULL&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;KEY&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;`zone_client_index`&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;`zone`&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;30&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)),&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;KEY&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;`client_index`&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;`client`&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;20&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;ENGINE&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;InnoDB&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;DEFAULT&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;CHARSET&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;utf8&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+&lt;p&gt;其中&lt;code class=&quot;highlighter-rouge&quot;&gt;dns_records&lt;/code&gt;表用于储存dns记录值，&lt;code class=&quot;highlighter-rouge&quot;&gt;xfr_table&lt;/code&gt;是用来做DNS复制使用的。&lt;/p&gt;
+
+&lt;p&gt;插入dns记录&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-Sql&quot;&gt;INSERT INTO `dns_records` VALUES
+('bindtest.example.com','@','SOA','bindtest.example.com.',300,NULL,120,900,604800,600,2018120210,'admin.bindtest.example.com.','ns1.bindtest.example.com.'),
+('bindtest.example.com','@','NS','ns1.bindtest.example.com.',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','@','NS','ns2.bindtest.example.com.',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','ns1','A','192.168.23.23',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','ns2','A','192.168.23.24',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','@','A','192.168.20.81',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;需要注意的是NS记录的值为辅助dns的IP。&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-Sql&quot;&gt;INSERT INTO `xfr_table` VALUES
+('bindtest.example.com','192.168.23.23'),
+('bindtest.example.com','192.168.23.24');
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;需要将辅助DNS的IP插入到这张表中。&lt;/p&gt;
+
+&lt;p&gt;3．配置bind&lt;/p&gt;
+
+&lt;p&gt;我们编译的bind目录在&lt;code class=&quot;highlighter-rouge&quot;&gt;/usr/local/bind/&lt;/code&gt;，配置文件位于&lt;code class=&quot;highlighter-rouge&quot;&gt;/usr/local/bind/etc&lt;/code&gt; 。由于我们编译的bind并没有一些基础的配置，首先需要把yum源里面的bind的一些基础的配置和默认的zone配置拷贝到我们定义的目录中。&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-Shell&quot;&gt;cp /usr/share/doc/bind-9.9.4/sample/var/named/named.* /var/cache/named/
+cp /usr/share/doc/bind-9.9.4/sample/etc/named.rfc1912.zones /usr/local/bind/etc
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;usr/local/bind/etc/named.conf&lt;/code&gt;：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;key &quot;rndc-key&quot; {
+	algorithm hmac-md5;
+	secret &quot;0FpSonU53LYhtZGbpMhR8w==&quot;;
+};
+
+controls {
+	inet 127.0.0.1 port 953 allow { 127.0.0.1; } keys { &quot;rndc-key&quot;; };
+};
+
+statistics-channels {
+  	inet 127.0.0.1 port 8053 allow { 127.0.0.1; };
+};
+
+include &quot;/usr/local/bind/etc/named.conf.options&quot;;
+include &quot;/usr/local/bind/etc/named.conf.logging&quot;;
+include &quot;/usr/local/bind/etc/bind.keys&quot;;
+
+zone &quot;.&quot; IN {
+	type hint;
+	file &quot;named.ca&quot;;
+};
+
+include &quot;/usr/local/bind/etc/named.rfc1912.zones&quot;;
+include &quot;/usr/local/bind/etc/named.dlz.zones&quot;;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/usr/local/bind/etc/named.conf.options&lt;/code&gt;：其中需要注意的是&lt;code class=&quot;highlighter-rouge&quot;&gt;also-notify&lt;/code&gt;和&lt;code class=&quot;highlighter-rouge&quot;&gt;allow-transfer&lt;/code&gt; 需要设置成辅助dns的IP。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;options {
+  directory &quot;/var/cache/bind&quot;;
+  zone-statistics yes;
+  statistics-file &quot;/var/cache/bind/data/named-stats.out&quot;;
+  allow-query {
+	any;
+  };
+  allow-transfer {
+	192.168.23.23;
+	192.168.23.24;
+  };
+  notify yes;
+  also-notify {
+	192.168.23.23;
+	192.168.23.24;
+  };
+  recursion no;
+  pid-file &quot;/run/named/named.pid&quot;;
+  session-keyfile &quot;/run/named/session.key&quot;;
+  #forwarders {
+  #      192.168.1.1;
+  #      192.168.1.2;
+  #      192.168.1.3;
+  #};
+  #forward only;
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/usr/local/bind/etc/named.conf.logging&lt;/code&gt;：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;logging {
+	channel default-log {
+		file &quot;data/default.log&quot; versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel query-log {
+		file &quot;data/query.log&quot; versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel security-log {
+		file &quot;data/security.log&quot; versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel other-log {
+		file &quot;data/other.log&quot; versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel database-log {
+		file &quot;data/database.log&quot; versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	category default {default-log;};
+	category queries { query-log;};
+	category security { security-log;};
+	category database { database-log;};
+	category lame-servers { null; };
+	category client { other-log;};
+	category config { other-log;};
+	category general { other-log;};
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/usr/local/bind/etc/named.dlz.zones&lt;/code&gt;:&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;dlz &quot;Mysql zone&quot; {
+   database &quot;mysql
+   {host=192.168.20.67 port=3306 dbname=bind user=db_bind_app pass=****** ssl=false}
+   {select zone from dns_records where zone = '$zone$'}
+   {select ttl, type, mx_priority, case when lower(type)='txt' then concat('\&quot;', data, '\&quot;')
+        when lower(type) = 'soa' then concat_ws(' ', data, resp_person, serial, refresh, retry, expire, minimum)
+        else data end from dns_records where zone = '$zone$' and host = '$record$'}
+   {}
+   {select ttl, type, host, mx_priority, case when lower(type)='txt' then
+        concat('\&quot;', data, '\&quot;') else data end, resp_person, serial, refresh, retry, expire,
+        minimum from dns_records where zone = '$zone$'}
+   {select zone from xfr_table where zone = '$zone$' and client = '$client$'}&quot;;
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;在辅助dns上&lt;code class=&quot;highlighter-rouge&quot;&gt;/usr/local/bind/etc/named.dlz.zones&lt;/code&gt;文件如下，我们将其配置成从主dns同步，需要将配置允许从主dns进行 notify和update。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;zone &quot;bindtest.example.com&quot; IN {
+    type slave;
+    file &quot;zone-from-mysql.db&quot;;
+    masters { 192.168.23.22; };
+    allow-update { 192.168.23.22; };
+    allow-notify {
+	192.168.23.22;
+	127.0.0.1;
+    };
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;编辑启动bind的systemd unit &lt;code class=&quot;highlighter-rouge&quot;&gt;/lib/systemd/system/named.service&lt;/code&gt;&lt;/p&gt;
+
+&lt;div class=&quot;language-shell highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;Unit]
+&lt;span class=&quot;nv&quot;&gt;Description&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;Bind DNS Server
+&lt;span class=&quot;nv&quot;&gt;After&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;network.target
+
+&lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;Service]
+&lt;span class=&quot;nv&quot;&gt;Type&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;forking
+&lt;span class=&quot;nv&quot;&gt;PIDFile&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/run/named/named.pid
+&lt;span class=&quot;nv&quot;&gt;ExecStart&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/usr/local/bind/sbin/named -c /usr/local/bind/etc/named.conf -u named
+
+&lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;Install]
+&lt;span class=&quot;nv&quot;&gt;WantedBy&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;multi-user.target
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;启动bind&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-Shell&quot;&gt;systemctl start named
+systemctl enable named
+&lt;/code&gt;&lt;/pre&gt;
+</description>
+        <pubDate>Sat, 23 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/bind/2017/09/23/dns-cluster.html</link>
+        <guid isPermaLink="true">http://localhost:4000/bind/2017/09/23/dns-cluster.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（9. harbor）</title>
+        <description>&lt;h3 id=&quot;kubernetes集群搭建9-镜像仓库harbor&quot;&gt;kubernetes集群搭建（9. 镜像仓库harbor）&lt;/h3&gt;
+
+&lt;p&gt;&lt;a href=&quot;https://github.com/vmware/harbor&quot;&gt;Harbor&lt;/a&gt;是VMware开发的企业级docker镜像仓库，官方提供了基于docker-compose的方式部署。&lt;br /&gt;
+花了好些时间将其conpose的编排模版转换成k8s的调度模版方便部署到k8s集群中，项目地址为: &lt;a href=&quot;https://github.com/huxos/harbor-kubernetes&quot;&gt;https://github.com/huxos/harbor-kubernetes&lt;/a&gt;。&lt;/p&gt;
+
+&lt;p&gt;部署架构：&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;把harbor的mysql组件部署到单独的一个Pod中，采用ceph的rbd作为数据库的存储。&lt;/li&gt;
+  &lt;li&gt;新增redis做session共享。&lt;/li&gt;
+  &lt;li&gt;采用ceph的rgw作为镜像的后端存储。&lt;/li&gt;
+  &lt;li&gt;其余组件（包括adminserver、jobservice、ui、nginx、registry）部署到同一个Pod中，使用127.0.0.1通讯。&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;这样部署可以通过k8s使得harbor灵活的缩放。&lt;/p&gt;
+
+&lt;h4 id=&quot;部署步骤&quot;&gt;部署步骤&lt;/h4&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署ceph-rgw并添加访问ceph的用户&lt;/p&gt;
+
+    &lt;p&gt;由于我们使用ceph的rgw作为registry的后端，首先参照之前部署ceph的步骤&lt;a href=&quot;http://huxos.me/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html&quot;&gt;kubernetes集群搭建（2. Ceph）&lt;/a&gt;
+在kube-system-2 kube-system-4上面部署&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-rgw&lt;/code&gt;&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph-deploy rgw create kube-system-2 kube-system-4
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;添加访问rgw的账户：&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;##创建用户
+radosgw-admin user create --uid=registry --display-name=&quot;ceph rgw docker registry user&quot;
+
+#registry支持ceph的swift协议，创建swift子账号
+radosgw-admin subuser create --uid registry --subuser=registry:swift --access=full --secret=secretkey --key-type=swift
+
+#创建secret key
+radosgw-admin key create --subuser=registry:swift --key-type=swift --gen-secret
+
+{
+    &quot;user_id&quot;: &quot;registry&quot;,
+    &quot;display_name&quot;: &quot;ceph rgw docker registry user&quot;,
+    &quot;email&quot;: &quot;&quot;,
+    &quot;suspended&quot;: 0,
+    &quot;max_buckets&quot;: 1000,
+    &quot;auid&quot;: 0,
+    &quot;subusers&quot;: [
+        {
+            &quot;id&quot;: &quot;registry:swift&quot;,
+            &quot;permissions&quot;: &quot;full-control&quot;
+        }
+    ],
+    &quot;keys&quot;: [
+        {
+            &quot;user&quot;: &quot;registry&quot;,
+            &quot;access_key&quot;: &quot;********************&quot;,
+            &quot;secret_key&quot;: &quot;****************************************&quot;
+        }
+    ],
+    &quot;swift_keys&quot;: [
+        {
+            &quot;user&quot;: &quot;registry:swift&quot;,
+            &quot;secret_key&quot;: &quot;e***************************************&quot;
+        }
+    ],
+    &quot;caps&quot;: [],
+    &quot;op_mask&quot;: &quot;read, write, delete&quot;,
+    &quot;default_placement&quot;: &quot;&quot;,
+    &quot;placement_tags&quot;: [],
+    &quot;bucket_quota&quot;: {
+        &quot;enabled&quot;: false,
+        &quot;max_size_kb&quot;: -1,
+        &quot;max_objects&quot;: -1
+    },
+    &quot;user_quota&quot;: {
+        &quot;enabled&quot;: false,
+        &quot;max_size_kb&quot;: -1,
+        &quot;max_objects&quot;: -1
+    },
+    &quot;temp_url_keys&quot;: []
+}
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+    &lt;p&gt;记录好上面的swift_keys里面的secret_key: &lt;code class=&quot;highlighter-rouge&quot;&gt;e*************************************** &lt;/code&gt;&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;生成registry 使用的证书&lt;/p&gt;
+
+    &lt;p&gt;参照前篇&lt;a href=&quot;http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html&quot;&gt;kubernetes集群搭建（3. Kube master）&lt;/a&gt;生成证书，供给harbor使用。&lt;/p&gt;
+
+    &lt;p&gt;编辑harbor.json&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;harbor&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;registry.example.com&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;quay.io&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;gcr.io&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+            &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;REGISTRY&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+        &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+    &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;使用命令: &lt;code class=&quot;highlighter-rouge&quot;&gt;cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server harbor.json | cfssljson -bare harbor&lt;/code&gt; 生成证书。&lt;br /&gt;
+这里的证书需要签名访问harbor使用的域名，根据实际情况替换掉&lt;code class=&quot;highlighter-rouge&quot;&gt;registry.example.com&lt;/code&gt;&lt;/p&gt;
+
+    &lt;p&gt;创建harbor部署的namespace:&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;kubectl create ns registry
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;作为secret导入证书：&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;kubectl create secret tls harbor --key harbor-key.pem --cert harbor.pem
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署harbor组件&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;harbor的部署模版以及提交到git仓库中，首先将其clone下来&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; git clone https://github.com/huxos/harbor-kubernetes.git
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;部署mysql组件&lt;/p&gt;
+
+        &lt;p&gt;参照前篇为导入ceph的key到registry中&lt;a href=&quot;http://huxos.me/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html&quot;&gt;kubernetes集群搭建（2. Ceph）&lt;/a&gt;&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; #导入ceph的key到registry的namespace中
+ kubectl create secret generic ceph-secret-kube --type=&quot;kubernetes.io/rbd&quot; \
+     --from-literal=key=`ceph --cluster ceph auth get-key client.kube` --namespace=registry
+
+ # mysql使用的rbd
+ kubectl create -f pvc/mysql-data.yaml
+
+ # 导入mysql的环境变量
+ kubectl create -f cm/db-env.yaml
+
+ # 部署mysql
+ kubectl create -f mysql.deploy.yaml
+
+ # svc
+ kubectl create -f svc/mysql.yaml
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;部署redis&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f redis.deploy.yaml
+ kubectl create -f svc/redis.yaml
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;部署harbor&lt;/p&gt;
+
+        &lt;p&gt;首先编辑cm下面的configMap文件、将&lt;code class=&quot;highlighter-rouge&quot;&gt;cm/registry.yaml&lt;/code&gt;里面的harbor的访问地址&lt;code class=&quot;highlighter-rouge&quot;&gt;registry.example.com&lt;/code&gt;根据实际情况替换掉，配置的ceph rgw的访问地址和密码。&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; #导入configmap
+ #adminserver
+ kubectl create -f cm/adminserver.yaml -f cm/adminserver-env.yaml
+ #jobservice
+ kubectl create -f cm/jobservice.yaml -f cm/jobservice-env.yaml
+ #registry
+ kubectl create -f cm/registry.yaml
+ #ui
+ kubectl create -f cm/ui-env.yaml -f cm/ui.yaml
+ #nginx
+ kubectl create -f cm/nginx.yaml
+
+ #部署harbor
+ kubectl create -f harbor.deploy.yaml
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;配置docker&lt;/p&gt;
+
+    &lt;p&gt;由于访问reigstry的证书是自签名的需要将ca放到docker的ca目录中&lt;/p&gt;
+
+    &lt;p&gt;将ca文件复制到 &lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/docker/&amp;lt;registry的访问域名&amp;gt;／ca.crt&lt;/code&gt;&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/harbor/2017/09/19/kubernetes-cluster-09-harbor.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/harbor/2017/09/19/kubernetes-cluster-09-harbor.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（8. prometheus）</title>
+        <description>&lt;blockquote&gt;
+  &lt;p&gt;&lt;a href=&quot;https://github.com/prometheus/prometheus&quot;&gt;Prometheus&lt;/a&gt; 的设计非常适合k8s集群的监控。&lt;br /&gt;
+大多数k8s的组件都提供prometheus格式的监控接口，只需要配置好kube-api作为promethues的sd就能非常容易的监控整个k8s集群，无需引入额外的依赖。&lt;br /&gt;
+prometheus提供了众多语言的库，可以非常容易的嵌入到业务代码中做业务监控。&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;可以采用CoreOS所提供的 &lt;a href=&quot;https://github.com/coreos/prometheus-operator&quot;&gt;prometheus-operator&lt;/a&gt;来部署prometheus，
+但是使用过程中发现其有些较不灵活的地方。比如：只能使用promethues-operator预定义的参数启动prometheus。 &lt;br /&gt;
+现将prometheus-operator生成的规则导出来做成configmap，独立部署prometheus，同时加入相关的规则使得其能够自动根据service的annotation进行发现和监控。&lt;/p&gt;
+
+&lt;h4 id=&quot;部署步骤&quot;&gt;部署步骤&lt;/h4&gt;
+
+&lt;p&gt;使用statefulset的方式部署prometheus，监控数据存储在ceph的rbd里面。 &lt;br /&gt;
+考虑到1.7版本的prometheus在数据轮换的时候产生大量的IO开销，所以部署了prometheus2.0 beta。&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;一些准备工作&lt;/p&gt;
+
+    &lt;p&gt;首先创建monitoring这个namespaces&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; # kubectl create ns monitoring
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;参照前面的&lt;a href=&quot;http://huxos.me/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html&quot;&gt;kubernetes集群搭建（2. Ceph）&lt;/a&gt;，
+ 在monitoring这个namespace中要使用RBD先要作为secret导入ceph的key。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create secret generic ceph-secret-kube --type=&quot;kubernetes.io/rbd&quot; \
+     --from-literal=key=`ceph --cluster ceph auth get-key client.kube` --namespace=monitoring
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;由于etcd部署了ssl，prometheus监控etcd需要先导入etcd的证书到k8s中用secret保存&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create secret generic etcd-client-ssl --from-file=ca.pem --from-file=client-key.pem --from-file=client.pem
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署prometheus&lt;/p&gt;
+
+    &lt;p&gt;部署prometheus的编排模版已经将其上传到了github上，首先将其clone下来。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; git clone https://github.com/huxos/prometheus-kubernetes.git
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;部署prometheus:&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f prometheus-rbac.yaml
+ kubectl create -f prometheus-k8s-cm.yaml
+ kubectl create -f prometheus-k8s-rules.yaml
+ kubectl create -f prometheus-statefulset.yaml
+ kubectl create -f prometheus-svc.yaml
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;部署alertmanager（alertmanager主要用来做prometheus的监控告警）：&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f alertmanager-cm.yaml
+ kubectl create -f alertmanager-statefulset.yaml
+ kubectl create -f alertmanager-svc.yaml
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;部署kube-state-metric（kube-state-metric用来获取k8s集群的关联信息）:&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f kube-state-metric-rbac.yaml
+ kubectl create -f kube-state-metric-deploy.yaml
+ kubectl create -f kube-state-metric-svc.yaml
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;部署node-exporter（如果需要宿主机的监控，需要部署node-exporter）：&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f node-exporter-ds.yaml
+ kubectl create -f node-exporter-svc.yaml
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;部署grafana（grafana用来做监控的绘图展示）：&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f grafana-credentails.secret.yaml
+ kubectl create -f grafana-deploy.yaml
+ kubectl create -f grafana-svc.yaml
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;创建相关enpoints用于kubelet、kube-conrtroller-manger、kube-scheduler、etcd等的监控：&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create -f prometheus-discovery-service.yaml
+
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;最后在grafan的页面（用户名：admin、密码：admin）mport文件夹dashborad里面的模版，就行了。&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h4 id=&quot;监控集群内的服务&quot;&gt;监控集群内的服务&lt;/h4&gt;
+
+&lt;p&gt;以ceph的监控为例，看看prometheus如何监控集群内的service。&lt;/p&gt;
+
+&lt;p&gt;首先部署好ceph-exporter、访问9128端口确保能正常获取数据、创建service让prometheus自动发现并采集ceph-exporter的监控信息：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    prometheus.io/scrape: &quot;true&quot;
+   labels:
+    k8s-app: ceph-exporter
+    run: ceph-exporter
+  name: ceph-exporter
+  namespace: monitoring
+spec:
+  clusterIP: None
+  ports:
+  - name: metrics
+    port: 9128
+    protocol: TCP
+    targetPort: 9128
+  selector:
+    run: ceph-exporter
+  type: ClusterIP
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;在service的 annotations 中加入&lt;code class=&quot;highlighter-rouge&quot;&gt;prometheus.io/scrape: &quot;true&quot;&lt;/code&gt; 就能使prometheus自动发现并监控。
+此外还可以通过&lt;code class=&quot;highlighter-rouge&quot;&gt;prometheus.io/schema&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;prometheus.io/path&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;prometheus.io/port&lt;/code&gt;等设置自动发现规则。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/prometheus/2017/09/19/kubernetes-cluster-08-prometheus.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/prometheus/2017/09/19/kubernetes-cluster-08-prometheus.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（7. ingress）</title>
+        <description>&lt;blockquote&gt;
+  &lt;p&gt;An &lt;a href=&quot;https://kubernetes.io/docs/concepts/services-networking/ingress/#what-is-ingress&quot;&gt;Ingress&lt;/a&gt; is a collection of rules that allow inbound connections to reach the cluster services.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Ingress的引入主要解决创建入口站点规则的问题，主要作用于7层入口(http)。
+可以通过K8s的Ingress对象定义类似于nginx中的vhost、localtion、upstream等。
+Nginx官方也有Ingress的实现&lt;a href=&quot;https://github.com/nginxinc/kubernetes-ingress/releases&quot;&gt;nginxinc/kubernetes-ingress&lt;/a&gt;来对接k8s。&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;&lt;a href=&quot;https://github.com/containous/traefik&quot;&gt;traefik&lt;/a&gt; Træfik (pronounced like traffic) is a modern HTTP reverse proxy and load balancer made to deploy microservices with ease. It supports several backends (Docker, Swarm mode, Kubernetes, Marathon, Consul, Etcd, Rancher, Amazon ECS, and a lot more) to manage its configuration automatically and dynamically.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;考虑到Traefik部署较为方便，使用traefik提供Ingress服务。&lt;/p&gt;
+
+&lt;h4 id=&quot;部署步骤&quot;&gt;部署步骤&lt;/h4&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;定义traefik需要的RBAC规则&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;apiVersion: v1
+kind: ServiceAccount
+metadata:
+  	  name: traefik-ingress-controller
+  	  namespace: kube-system
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: traefik-ingress-controller
+rules:
+  - apiGroups:
+      - &quot;&quot;
+    resources:
+      - pods
+      - services
+      - endpoints
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: traefik-ingress-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traefik-ingress-controller
+subjects:
+- kind: ServiceAccount
+  name: traefik-ingress-controller
+  namespace: kube-system
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;定义ingress编排的daemonset模版&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: extensions/v1beta1
+ kind: DaemonSet
+ metadata:
+   labels:
+     k8s-app: traefik-ingress-lb
+   name: traefik-ingress-controller
+   namespace: kube-system
+ spec:
+   selector:
+     matchLabels:
+       k8s-app: traefik-ingress-lb
+   template:
+     metadata:
+       labels:
+         k8s-app: traefik-ingress-lb
+         name: traefik-ingress-lb
+     spec:
+       containers:
+       - args:
+         - --web
+         - --web.address=:8580
+         - --kubernetes
+         - --web.metrics
+         - --web.metrics.prometheus
+         image: traefik
+         imagePullPolicy: IfNotPresent
+         name: traefik-ingress-lb
+         ports:
+         - containerPort: 80
+           hostPort: 80
+           protocol: TCP
+         - containerPort: 8580
+           hostPort: 8580
+           protocol: TCP
+         resources:
+           requests:
+             cpu: &quot;2&quot;
+             memory: 4G
+       dnsPolicy: ClusterFirst
+       hostNetwork: true
+       nodeSelector:
+         role: ingress
+       restartPolicy: Always
+       schedulerName: default-scheduler
+       serviceAccount: traefik-ingress-controller
+       serviceAccountName: traefik-ingress-controller
+       terminationGracePeriodSeconds: 60
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;采用Host Network的方式，部署traekfik&lt;br /&gt;
+ 通过&lt;code class=&quot;highlighter-rouge&quot;&gt;kubectl label node &amp;lt;NODE&amp;gt; role=ingress&lt;/code&gt; 为节点打上相应的标签。&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;创建ingress规则&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: metadata
+  namespace: default
+spec:
+  rules:
+  - host: metadata.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: metadata-server
+          servicePort: 80
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;这样其实相当于定义了一个http的站点，域名metadata.example.com 指向了default的metadata-server这个服务。&lt;/p&gt;
+
+    &lt;p&gt;访问相关节点的8580端口就能看到metadata.example.com站点对应的信息了。&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-07-ingress.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-07-ingress.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（6. loadbancer）</title>
+        <description>&lt;blockquote&gt;
+  &lt;p&gt;kubernetes在定义Service的时候提供了LoadBalancer类型，用于集群外部访问到kubernetes的服务。&lt;br /&gt;
+但是这里的LoadBalancer主要对接用云服务商提供的负载均衡服务，在物理机部署的环境就不是很适用了。&lt;br /&gt;
+结合kubernetes本身的Service就提供了负载均衡的功能，想到一个巧妙的方法: 把Service的Cluster IP做成可以在集群外部可以路由。&lt;br /&gt;
+可以在交换机上面配置等价路由，将Cluster IP段路由到kube-proxy的节点就行了，这种方式最多支持8个节点做集群的负载均衡。&lt;br /&gt;
+考虑到kube-proxy的冗长的iptables规则，当service的数目多了之后性能上会存在问题，所以采用kube-router作为负载均衡节点。&lt;br /&gt;
+kube-router基于IPVS实现，转发效率上会更高，规则可读性也会更好。&lt;br /&gt;
+如果集群网络是采用overlay，那么这种方式的可能的瓶颈在与做负载均衡的节点对集群内外的流量解封包的过程，小规模使用起来应该是没有问题。&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;另外即将发布的kubernetes 1.8中kube-proxy原生就支持IPVS，到时可以少引入kube-router这依赖了。&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;&lt;a href=&quot;https://github.com/cloudnativelabs/kube-router&quot;&gt;kube-router&lt;/a&gt; A distributed load balancer, firewall and router designed for Kubernetes。&lt;/p&gt;
+
+&lt;p&gt;根据官网的介绍kube-router有三个部分组成&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;
+    &lt;p&gt;第一部分：&lt;code class=&quot;highlighter-rouge&quot;&gt;--run-service-proxy&lt;/code&gt; 基于IPVS的负载均衡器（IPVS/LVS based service proxy）可用于替换掉kube-proxy，用作kubenetes中的service的负载均衡。&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;第二部分：&lt;code class=&quot;highlighter-rouge&quot;&gt;--run-router&lt;/code&gt; 基于BGP实现的跨主机网络（Pod Networking）&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;第三部分：&lt;code class=&quot;highlighter-rouge&quot;&gt;--run-firewall&lt;/code&gt; 网络访问策略控制器（Network Policy Controller），基于ipset和iptables实现。&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;我们仅使用其了service-proxy的功能。&lt;br /&gt;
+本例部署在10.22.108.100、10.22.108.101 这两个机器上。&lt;br /&gt;
+服务启动之后会使用ClusterIP配置LVS的virtual server，并且在新增虚拟网口上绑定ClusterIP，设置好ipvs的规则，通过LVS使用nat方式将流量转发到容器中。&lt;br /&gt;
+我们在上层交换机上指定两条等价路由，将ClusterIP的地址段指向这两个机器，并且做好存活检测。&lt;/p&gt;
+
+&lt;h4 id=&quot;部署步骤&quot;&gt;部署步骤&lt;/h4&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;到入kube-router使用的rbac规则&lt;/p&gt;
+
+    &lt;p&gt;为了简化操作我们让&lt;code class=&quot;highlighter-rouge&quot;&gt;kube-router&lt;/code&gt;使用前篇&lt;a href=&quot;http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-04-kube-node.html&quot;&gt;kubernetes集群搭建（4. kube node）&lt;/a&gt;
+ 中创建的&lt;code class=&quot;highlighter-rouge&quot;&gt;proxy-kubeconfig.yaml&lt;/code&gt;来访问apiserver。&lt;br /&gt;
+ 需要创建好kube-router需要的RBAC规则授权给&lt;code class=&quot;highlighter-rouge&quot;&gt;system:kube-proxy&lt;/code&gt;这个用户。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kind: ClusterRole
+ apiVersion: rbac.authorization.k8s.io/v1beta1
+ metadata:
+   name: kube-router
+   namespace: kube-system
+ rules:
+   - apiGroups:
+     - &quot;&quot;
+     resources:
+       - namespaces
+       - pods
+       - services
+       - nodes
+       - endpoints
+     verbs:
+       - list
+       - get
+       - watch
+   - apiGroups:
+     - &quot;networking.k8s.io&quot;
+     resources:
+       - networkpolicies
+     verbs:
+       - list
+       - get
+       - watch
+   - apiGroups:
+     - extensions
+     resources:
+       - networkpolicies
+     verbs:
+       - get
+       - list
+       - watch
+ ---
+ kind: ClusterRoleBinding
+ apiVersion: rbac.authorization.k8s.io/v1beta1
+ metadata:
+   name: kube-router
+ roleRef:
+   apiGroup: rbac.authorization.k8s.io
+   kind: ClusterRole
+   name: kube-router
+ subjects:
+ - kind: User
+   name: system:kube-proxy
+   namespace: kube-system
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;将proxy-kubeconfig.yaml拷贝到两个机器的&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/&lt;/code&gt;目录。&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;创建kube-router的Daemonset&lt;/p&gt;
+
+    &lt;p&gt;我们创建kube-router的调度模版，将kube-router调度到label为&lt;code class=&quot;highlighter-rouge&quot;&gt;role=lb&lt;/code&gt; 的机器上。&lt;br /&gt;
+ 需要把&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/proxy-kubeconfig.yaml&lt;/code&gt;挂载到容器中，kube-router会读取此文件的配置访问apiserver。&lt;br /&gt;
+ 需要特权模式运行，并且把&lt;code class=&quot;highlighter-rouge&quot;&gt;/lib/modules&lt;/code&gt;挂载到容器中。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: extensions/v1beta1
+ kind: DaemonSet
+ metadata:
+   labels:
+     k8s-app: kube-router
+   name: kube-router
+   namespace: kube-system
+ spec:
+   revisionHistoryLimit: 10
+   selector:
+     matchLabels:
+       k8s-app: kube-router
+   template:
+     metadata:
+       annotations:
+         scheduler.alpha.kubernetes.io/critical-pod: &quot;&quot;
+       labels:
+         k8s-app: kube-router
+     spec:
+       containers:
+       - args:
+         - --kubeconfig=/var/lib/kube-router/kubeconfig
+         - --run-service-proxy=true
+         - --run-router=false
+         - --run-firewall=false
+         env:
+         - name: NODE_NAME
+           valueFrom:
+             fieldRef:
+               apiVersion: v1
+               fieldPath: spec.nodeName
+         image: cloudnativelabs/kube-router:v0.0.12
+         imagePullPolicy: IfNotPresent
+         name: kube-router
+         securityContext:
+           privileged: true
+         volumeMounts:
+         - mountPath: /lib/modules
+           name: lib-modules
+           readOnly: true
+         - mountPath: /var/lib/kube-router/kubeconfig
+           name: kubeconfig
+       dnsPolicy: ClusterFirst
+       hostNetwork: true
+       nodeSelector:
+         role: lb
+       restartPolicy: Always
+       volumes:
+       - hostPath:
+           path: /lib/modules
+         name: lib-modules
+       - hostPath:
+           path: /etc/kubernetes/proxy-kubeconfig.yaml
+         name: kubeconfig
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;为两个机器打上相应的label，等待启动成功我们可以是用&lt;code class=&quot;highlighter-rouge&quot;&gt;ipvsadm -Ln&lt;/code&gt;来查看规则是否生效。&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;创建SNAT规则&lt;/p&gt;
+
+    &lt;p&gt;等待上面的容器启动之后发现不能正常工作，经查发现IPVS实现了DNAT，只对目的地址执行了转换，要使得POD正常回包，还需要再设置SNAT。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; iptables -t nat -A POSTROUTING -m ipvs --vdir ORIGINAL --vmethod MASQ -m comment --comment &quot;ipvs snat rule&quot; -j MASQUERADE
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;这点有点像Full NAT模式，只不过SNAT由iptables完成的。&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;配置交换机等价路由&lt;/p&gt;
+
+    &lt;p&gt;最后需要在交换机上面配置好等价路由将clusterIP段 10.99.66.0/23 路由到这两个机器上就行了。&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;至此基于IPVS的和ClusterIP的负载均衡就搭建完成了。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-06-loadbancer.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-06-loadbancer.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（5. kube-dns、dashboard）</title>
+        <description>&lt;blockquote&gt;
+  &lt;p&gt;kube-dns、dashboard以deployment的方式部署到kubernetes，运行在kube-system这个namespace中。
+只需要导入相应的模版就行，部署较为简单。&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;下载&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; # wget https://github.com/kubernetes/kubernetes/releases/download/v1.7.4/kubernetes.tar.gz  -O - |tar -zxpvf -
+ # cd kubernetes
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;kube-dns&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ~/kubernetes # cd cluster/addons/dns
+ ~/k/c/a/dns # rm -rf *.yaml.sed
+ ~/k/c/a/dns # cat  transforms2sed.sed
+ s/__PILLAR__DNS__SERVER__/10.99.66.2/g
+ s/__PILLAR__DNS__DOMAIN__/cluster.local/g
+ s/__MACHINE_GENERATED_WARNING__/Warning: This is a file generated from the base underscore template file: __SOURCE_FILENAME__/g
+ ~/k/c/a/dns # make
+ sed -f transforms2sed.sed kubedns-controller.yaml.base  | sed s/__SOURCE_FILENAME__/kubedns-controller.yaml.base/g &amp;gt; kubedns-controller.yaml.sed
+ sed -f transforms2sed.sed kubedns-svc.yaml.base  | sed s/__SOURCE_FILENAME__/kubedns-svc.yaml.base/g &amp;gt; kubedns-svc.yaml.sed
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;ul&gt;
+      &lt;li&gt;进入&lt;code class=&quot;highlighter-rouge&quot;&gt;cluster/addons/dns&lt;/code&gt;目录&lt;/li&gt;
+      &lt;li&gt;删除&lt;code class=&quot;highlighter-rouge&quot;&gt;*.yaml.sed&lt;/code&gt;&lt;/li&gt;
+      &lt;li&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;transforms2sed.sed&lt;/code&gt; 将里面的&lt;code class=&quot;highlighter-rouge&quot;&gt;$DNS_SERVER&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;$DNS_DOMAIN&lt;/code&gt;替换成相应的地址和集群名字&lt;/li&gt;
+      &lt;li&gt;然后执行&lt;code class=&quot;highlighter-rouge&quot;&gt;make&lt;/code&gt;指令，就生成了kube-dns的模版&lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;最后导入模版到kubernetes 集群&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;  kubectl create -f  kubedns-cm.yaml -f kubedns-sa.yaml  -f kubedns-controller.yaml.sed -f kubedns-svc.yaml.sed
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+    &lt;/ul&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;dashboard 插件部署&lt;/p&gt;
+
+    &lt;p&gt;首先创建server-account&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    k8s-app: kubernetes-dashboard
+  name: kubernetes-dashboard
+  namespace: kube-system
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;创建ClusterRoleBonding，分配k8s内置的view角色给它，访问到kube-dashbroad的用户拥有只读的权限。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    k8s-app: kubernetes-dashboard
+  name: kubernetes-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+- kind: ServiceAccount
+  name: kubernetes-dashboard
+  namespace: kube-system
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;进入&lt;code class=&quot;highlighter-rouge&quot;&gt;cluster/addons/dashboard&lt;/code&gt; 编辑 &lt;code class=&quot;highlighter-rouge&quot;&gt;dashboard-controller.yaml&lt;/code&gt; 加入&lt;code class=&quot;highlighter-rouge&quot;&gt;serviceAccount: kubernetes-dashboard&lt;/code&gt;。&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;....
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 9090
+          initialDelaySeconds: 30
+          timeoutSeconds: 30
+      serviceAccount: kubernetes-dashboard #添加sa
+      tolerations:
+      - key: &quot;CriticalAddonsOnly&quot;
+        operator: &quot;Exists&quot;
+....
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;最后执行&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;kubectl create -f dashboard-controller.yaml dashboard-service.yaml
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;至此kube-dns、dashboard就部署完成了。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-05-kube-addons.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-05-kube-addons.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（4. kube node）</title>
+        <description>&lt;p&gt;本例Kube Node节点的kubelet通过VIP 10.22.108.250与APIServer通讯。kubelet第一次通过启动tls bootstrap认证后，由apiserver生成节点的证书。&lt;/p&gt;
+
+&lt;h4 id=&quot;部署步骤&quot;&gt;部署步骤&lt;/h4&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;网络组建部署&lt;/p&gt;
+
+    &lt;p&gt;参照上篇&lt;a href=&quot;http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html&quot;&gt;kubernetes集群搭建（3. Kube master）&lt;/a&gt; 配置好flanneld 以及CNI&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kubelet&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;生成kubectl获取认证的bootstrap-kubeconfig&lt;/p&gt;
+
+        &lt;p&gt;使用如下命令生成&lt;code class=&quot;highlighter-rouge&quot;&gt;bootstrap-kubeconfig.yaml&lt;/code&gt;&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;kubectl config set-cluster kubernetes \
+    --certificate-authority=cert/ca.pem \
+    --embed-certs=true \
+    --server=http://10.22.108.250:6443 \
+    --kubeconfig=bootstrap-kubeconfig.yaml
+
+kubectl config set-credentials kubelet-bootstrap \
+    --token=${BOOTSTRAP} \
+    --kubeconfig=bootstrap-kubeconfig.yaml
+
+kubectl config set-context default \
+    --cluster=kubernetes \
+    --user=kubelet-bootstrap \
+    --kubeconfig=bootstrap-kubeconfig.yaml
+
+kubectl config use-context default --kubeconfig=bootstrap-kubeconfig.yaml
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;--embed-certs=true&lt;/code&gt; 选项可以让生成的证书.pem 文件内嵌到yaml文件中，简化配置文件。
+生成bootstrap-kubeconfig.yaml之后传输到node节点上，放到&lt;code class=&quot;highlighter-rouge&quot;&gt;/ete/kubernetes/&lt;/code&gt; 目录中。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;下载kubelet&lt;/p&gt;
+
+        &lt;p&gt;到node节点，使用下面的命令下载kubelet&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; wegt https://storage.googleapis.com/kubernetes-release/release/v1.7.3/bin/linux/amd64/kubelet -O /opt/bin/kubelet &amp;amp;&amp;amp; \
+ chmod +x /opt/bin/kubelet
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;配置 kubelet 启动的systemd unit&lt;/p&gt;
+
+        &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/lib/systemd/system/kubelet.service&lt;/code&gt;:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; [Service]
+ ExecStartPre=/bin/mkdir -p /etc/kubernetes/manifests
+ ExecStart=/opt/bin/kubelet \
+   --require-kubeconfig \
+   --experimental-bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubeconfig.yaml \
+   --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+   --cert-dir=/etc/kubernetes/ssl \
+   --container-runtime=docker \
+   --docker=unix:///var/run/docker.sock \
+   --network-plugin=cni \
+   --allow-privileged=true \
+   --pod-manifest-path=/etc/kubernetes/manifests \
+   --hostname-override=10.22.108.80 \
+   --cluster-dns=10.99.66.2 \
+   --cluster-domain=cluster.local \
+   --max-pods=32 \
+   --serialize-image-pulls=false \
+   --pod-infra-container-image=gcr.io/google_containers/pause-amd64:3.0
+ Restart=always
+ RestartSec=10
+
+ [Install]
+ WantedBy=multi-user.target
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;ul&gt;
+          &lt;li&gt;
+            &lt;p&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;--hostname-override=10.22.108.80 &lt;/code&gt; 此处更改为node节点的IP&lt;/p&gt;
+          &lt;/li&gt;
+          &lt;li&gt;
+            &lt;p&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;--kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml --cert-dir=/etc/kubernetes/ssl&lt;/code&gt;
+ kubelet认证成功之后将会生成/etc/kubernetes/worker-kubeconfig.yaml， 并且在/etc/kubernetes/ssl 目录下面生成证书。&lt;/p&gt;
+          &lt;/li&gt;
+          &lt;li&gt;
+            &lt;p&gt;使用&lt;code class=&quot;highlighter-rouge&quot;&gt;systemctl enable  kubelet &amp;amp;&amp;amp; systemctl start kubelet&lt;/code&gt; 启动kubelet。&lt;/p&gt;
+          &lt;/li&gt;
+        &lt;/ul&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;通过 kubelet 的证书请求&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;# kubectl get csr
+NAME                                                   AGE       REQUESTOR           CONDITION
+node-csr-K9fSKHorWHsmTl4X7iApDB5DPAEEidAnmt93ia8Aydk   2m       kubelet-bootstrap   Pending
+# kubectl certificate approve node-csr-K9fSKHorWHsmTl4X7iApDB5DPAEEidAnmt93ia8Aydk
+# kubectl get node
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kube-proxy&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;生成kube-proxy使用的kubeconfig&lt;/p&gt;
+
+        &lt;p&gt;上篇&lt;a href=&quot;http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html&quot;&gt;kubernetes集群搭建（3. Kube master）&lt;/a&gt; 生成了kube-proxy所使用的证书文件，现在利用证书生成proxy-kubeconfig.yaml。&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;kubectl config set-cluster kubernetes \
+    --certificate-authority=cert/ca.pem \
+    --embed-certs=true \
+    --server=https://10.22.108.250:6443
+    --kubeconfig=proxy-kubeconfig.yaml
+
+kubectl config set-credentials proxy \
+    --client-certificate=cert/proxy.pem \
+    --client-key=cert/proxy-key.pem \
+    --embed-certs=true
+    --kubeconfig=proxy-kubeconfig.yaml
+
+kubectl config set-context default \
+    --cluster=kubernetes \
+    --user=porxy
+    --kubeconfig=proxy-kubeconfig.yaml
+
+kubectl config use-context default --kubeconfig=proxy-kubeconfig.yaml
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+        &lt;p&gt;将proxy-kubeconfig.yaml 拷贝到node节点的&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/&lt;/code&gt;目录下。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;配置kube-proxy启动的static pod&lt;/p&gt;
+
+        &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/manifests/kube-proxy.yaml&lt;/code&gt;:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+spec:
+  hostNetwork: true
+  containers:
+  - name: kube-proxy
+    image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+    command:
+    - /hyperkube
+    - proxy
+    - --hostname-override=10.22.108.80
+    - --cluster-cidr=10.99.66.0/23
+    - --kubeconfig=/etc/kubernetes/proxy-kubeconfig.yaml
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - mountPath: /etc/ssl/certs
+      name: ssl-certs-host
+      readOnly: true
+    - mountPath: /etc/kubernetes/proxy-kubeconfig.yaml
+      name: proxy-kubeconfig
+  volumes:
+  - hostPath:
+      path: /usr/share/ca-certificates
+    name: ssl-certs-host
+  - hostPath:
+      path: /etc/kubernetes/proxy-kubeconfig.yaml
+    name: proxy-kubeconfig
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;--hostname-override=10.22.108.80&lt;/code&gt; 此处需要修改成节点的IP，由于POD需要操作iptables 所以需要：&lt;code class=&quot;highlighter-rouge&quot;&gt;privileged: true&lt;/code&gt; 。&lt;/p&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;至此kube node节点就部署完成了。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-04-kube-node.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-04-kube-node.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（3. Kube master）</title>
+        <description>&lt;p&gt;本例中部署了kubernetes部署了Master三个节点，可以使用部署Keepalived做Apiserver的高可用。&lt;br /&gt;
+其中kubelet是采用systemd启动在物理机上面的，其他组件通过kubernetes的manifests启动在容器里面。&lt;br /&gt;
+三个Kubernetes Master的IP地址为：10.22.108.20、10.22.108.79、10.22.108.92，假定使用10.22.108.250作为Apiserver的VIP。&lt;/p&gt;
+
+&lt;h4 id=&quot;k8s集群配置&quot;&gt;k8s集群配置&lt;/h4&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;kube-apiserver: 10.22.108.20,10.22.108.79,10.22.108.92, VIP: 10.22.108.250&lt;/li&gt;
+  &lt;li&gt;service-cidr: 10.99.66.0/23&lt;/li&gt;
+  &lt;li&gt;cluster-domain: cluster.local&lt;/li&gt;
+  &lt;li&gt;cluster-cidr: 10.20.0.0/16&lt;/li&gt;
+  &lt;li&gt;apiserver-service-ip: 10.99.66.1&lt;/li&gt;
+  &lt;li&gt;kubedns-service-ip: 10.99.66.2&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h4 id=&quot;部署过程&quot;&gt;部署过程&lt;/h4&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;生成证书&lt;/p&gt;
+
+    &lt;p&gt;采用CloudFlare的PKI工具集 &lt;a href=&quot;https://github.com/cloudflare/cfssl&quot;&gt;cfssl&lt;/a&gt;来制作证书。&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;安装cfssl&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; export GOPATH=${GOPATH:-$HOME/go}
+ go get -u github.com/cloudflare/cfssl/cmd/...
+ export PATH=$GOPATH/bin:$PATH
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;生成ca&lt;/p&gt;
+
+        &lt;p&gt;编辑ca-config.json：&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;signing&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;default&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;expiry&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;87600h&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;profiles&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;server&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;expiry&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;87600h&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;usages&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;signing&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;key encipherment&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;server auth&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;client&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;expiry&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;87600h&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;usages&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;signing&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;key encipherment&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;client auth&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;peer&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;expiry&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;87600h&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;usages&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;signing&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;key encipherment&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;server auth&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                     &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;client auth&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+                 &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;ca-csr.json&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;KUBERNETES&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;使用命令&lt;code class=&quot;highlighter-rouge&quot;&gt;cfssl gencert -initca ca-csr.json | cfssljson -bare ca -&lt;/code&gt; 生成ca证书。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;生成etcd的证书&lt;/p&gt;
+
+        &lt;p&gt;生成etcd-server证书，编辑server.json：&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;server&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;etcd&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;127.0.0.1&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.20&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.79&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.92&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;ETCD&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;使用如下命令生成etcd server证书:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server server.json | cfssljson -bare server
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;为每一个节点生成etcd peer证书，给etc集群内部通讯使用，执行如下脚本生成证书：&lt;/p&gt;
+
+        &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;nv&quot;&gt;index&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;0
+ &lt;span class=&quot;k&quot;&gt;for &lt;/span&gt;SERVER &lt;span class=&quot;k&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.20&quot;&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.79&quot;&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.92&quot;&lt;/span&gt;
+ &lt;span class=&quot;k&quot;&gt;do
+ &lt;/span&gt;cat &lt;span class=&quot;sh&quot;&gt;&amp;lt;&amp;lt;EOF | cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=peer - | cfssljson -bare server${index}
+ {
+     &quot;CN&quot;: &quot;infra${index}&quot;,
+     &quot;hosts&quot;: [
+         &quot;etcd&quot;,
+         &quot;$SERVER&quot;,
+         &quot;127.0.0.1&quot;
+     ],
+     &quot;key&quot;: {
+         &quot;algo&quot;: &quot;rsa&quot;,
+         &quot;size&quot;: 2048
+     },
+     &quot;names&quot;: [
+         {
+             &quot;O&quot;: &quot;ETCD&quot;
+         }
+     ]
+ }
+ EOF
+&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;index&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;sb&quot;&gt;`&lt;/span&gt;expr &lt;span class=&quot;nv&quot;&gt;$index&lt;/span&gt; + 1&lt;span class=&quot;sb&quot;&gt;`&lt;/span&gt;
+ &lt;span class=&quot;k&quot;&gt;done&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;生成etcd client证书，编辑client.json：&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;client&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;ETCD&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;使用如下命令生成etcd client证书，kube-apiserver访问etcd时使用。&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client client.json | cfssljson -bare client
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;生成kuberbetes相关的证书&lt;/p&gt;
+
+        &lt;ol&gt;
+          &lt;li&gt;
+            &lt;p&gt;生成api-server的证书&lt;/p&gt;
+
+            &lt;p&gt;编辑kube-apiserver.json:&lt;/p&gt;
+
+            &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kube-apiserver&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes.default&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes.default.svc&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes.default.svc.cluster.local&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;127.0.0.1&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.101.66.1&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.20&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.79&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.92&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;10.22.108.250&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;system:kube-apiserver&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+            &lt;/div&gt;
+
+            &lt;p&gt;使用下面的命令生成证书：&lt;/p&gt;
+
+            &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server kube-apiserver.json | \
+     cfssljson -bare apiserver
+&lt;/code&gt;&lt;/pre&gt;
+            &lt;/div&gt;
+
+            &lt;p&gt;#&lt;code class=&quot;highlighter-rouge&quot;&gt;NOTE&lt;/code&gt; 配置中的&lt;code class=&quot;highlighter-rouge&quot;&gt;hosts&lt;/code&gt;要包含访问apiserver用得到的所有的域名和IP。&lt;/p&gt;
+          &lt;/li&gt;
+          &lt;li&gt;
+            &lt;p&gt;生成kube-proxy的证书&lt;/p&gt;
+
+            &lt;p&gt;编辑kube-proxy.json:&lt;/p&gt;
+
+            &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;system:kube-proxy&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;KUBERNETES&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+            &lt;/div&gt;
+
+            &lt;p&gt;执行命令：&lt;/p&gt;
+
+            &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client kube-proxy.json | cfssljson -bare proxy
+&lt;/code&gt;&lt;/pre&gt;
+            &lt;/div&gt;
+          &lt;/li&gt;
+          &lt;li&gt;
+            &lt;p&gt;生成kube-master证书&lt;/p&gt;
+
+            &lt;p&gt;编辑kube-master.json:&lt;/p&gt;
+
+            &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kube-master&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;system:masters&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+            &lt;/div&gt;
+
+            &lt;p&gt;执行命令:&lt;/p&gt;
+
+            &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client kube-master.json | cfssljson -bare master
+&lt;/code&gt;&lt;/pre&gt;
+            &lt;/div&gt;
+
+            &lt;p&gt;该证书用来管理集群使用，具有超级管理员的权限。关于kubernetes的API的授权相关内容参考：&lt;a href=&quot;https://kubernetes.io/docs/admin/authorization/rbac/&quot;&gt;Using RBAC Authorization&lt;/a&gt;。&lt;/p&gt;
+          &lt;/li&gt;
+        &lt;/ol&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kubelet&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;下载kubelet的binary到/opt/bin/&lt;/p&gt;
+
+        &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; wegt https://storage.googleapis.com/kubernetes-release/release/v1.7.3/bin/linux/amd64/kubelet -O /opt/bin/kubelet &lt;span class=&quot;o&quot;&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\ &lt;/span&gt;
+ chmod +x /opt/bin/kubelet
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;编辑systemd配置文件&lt;/p&gt;
+
+        &lt;p&gt;vim &lt;code class=&quot;highlighter-rouge&quot;&gt;/lib/systemd/system/kubelet.service&lt;/code&gt;：&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; [Unit]
+ After=docker.service
+ Requires=docker.service
+ [Service]
+ ExecStartPre=/bin/mkdir -p /etc/kubernetes/manifests
+ ExecStart=/opt/bin/kubelet \
+ --require-kubeconfig=true \
+ --serialize-image-pulls=false \
+ --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+ --network-plugin=cni \
+ --allow-privileged=true \
+ --container-runtime=docker \
+ --docker=unix:///var/run/docker.sock \
+ --pod-manifest-path=/etc/kubernetes/manifests \
+ --hostname-override=10.22.108.20 \ #NOTE此处需要修改成所在机器IP
+ --cluster-dns=10.99.66.2 \
+ --cluster-domain=cluster.local \
+ --max-pods=32 \
+ --pod-infra-container-image=gcr.io/google_containers/pause-amd64:3.0
+ Restart=always
+ RestartSec=10
+ [Install]
+ WantedBy=multi-user.target
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;编辑kubelet访问apiserver的kubeconfig文件&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/worker-kubeconfig.yaml&lt;/code&gt; ：&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: v1
+ clusters:
+ - cluster:
+     server: http://127.0.0.1:8080
+   name: default
+ contexts:
+ - context:
+     cluster: default
+     user: &quot;&quot;
+   name: default
+ current-context: default
+ kind: Config
+ preferences: {}
+ users: []
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署etcd&lt;/p&gt;
+
+    &lt;p&gt;etcd采用kubernetes的static pod的方式部署在k8s的master节点上。&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;将上面生成的etcd相关的证书包括&lt;code class=&quot;highlighter-rouge&quot;&gt;server.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;server-key.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;ca.pem&lt;/code&gt; 拷贝到&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/etcd/ssl&lt;/code&gt;目录下，&lt;br /&gt;
+ 将&lt;code class=&quot;highlighter-rouge&quot;&gt;server{0..2}.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;server{0..2}-key.pem&lt;/code&gt;分别拷贝到对应三个机器的&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/etcd/ssl&lt;/code&gt; 目录中，&lt;br /&gt;
+ 改名成&lt;code class=&quot;highlighter-rouge&quot;&gt;memeber.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;memeber-key.pem&lt;/code&gt;。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/manifests/etcd.yaml&lt;/code&gt;&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: v1
+ kind: Pod
+ metadata:
+   name: etcd
+   namespace: kube-system
+   labels:
+     k8s-app: etcd
+ spec:
+   hostNetwork: true
+   containers:
+   - name: etcd
+     image: quay.io/coreos/etcd:v3.2.3
+     command:
+     - etcd
+     - --name=infra0
+     - --data-dir=/var/etcd/data
+     - --cert-file=/etc/etcd/ssl/server.pem
+     - --key-file=/etc/etcd/ssl/server-key.pem
+     - --trusted-ca-file=/etc/etcd/ssl/ca.pem
+     - --peer-cert-file=/etc/etcd/ssl/member.pem
+     - --peer-key-file=/etc/etcd/ssl/member-key.pem
+     - --peer-trusted-ca-file=/etc/etcd/ssl/ca.pem
+     - --client-cert-auth
+     - --peer-client-cert-auth
+     - --initial-advertise-peer-urls=https://10.22.108.20:2380
+     - --listen-peer-urls=https://10.22.108.20:2380
+     - --listen-client-urls=https://10.22.108.20:2379,https://127.0.0.1:2379
+     - --advertise-client-urls=https://10.22.108.20:2379
+     - --initial-cluster-token=6522f860-7ffb-495c-83ee-a0a4ebc39f90
+     - --initial-cluster=infra0=https://10.22.108.20:2380,infra1=https://10.22.108.79:2380,infra2=https://10.22.108.92:2380
+     - --initial-cluster-state=new
+     volumeMounts:
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+     - mountPath: /var/etcd/data
+       name: etcd-data
+     - mountPath: /etc/etcd/ssl
+       name: ssl-certs-etcd
+   volumes:
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+   - hostPath:
+       path: /var/etcd/data
+     name: etcd-data
+   - hostPath:
+       path: /etc/etcd/ssl
+     name: ssl-certs-etcd
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;需要注意的是：&lt;code class=&quot;highlighter-rouge&quot;&gt;--name=infra0&lt;/code&gt;此处三个机器分别是infra0、infra1、infra2，需要上面各处出现的地址改成相应机器的IP，&lt;br /&gt;
+ &lt;code class=&quot;highlighter-rouge&quot;&gt;--initial-cluster-token&lt;/code&gt; 此处使用&lt;code class=&quot;highlighter-rouge&quot;&gt;uuidgen&lt;/code&gt;生成且各个机器保持一致，&lt;br /&gt;
+ &lt;code class=&quot;highlighter-rouge&quot;&gt;--initial-cluster=infra0=https://10.22.108.20:2380,infra1=https://10.22.108.79:2380,infra2=https://10.22.108.92:2380&lt;/code&gt;此处各个机器的name和url保持对应。&lt;/p&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kube-apiserver&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;将上面生成的&lt;code class=&quot;highlighter-rouge&quot;&gt;apiserver.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;apiserver-key.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;ca.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;ca-key.pem&lt;/code&gt;拷贝到&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/ssl&lt;/code&gt;文件夹中。 &lt;br /&gt;
+ 将&lt;code class=&quot;highlighter-rouge&quot;&gt;client.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;client-key.pem&lt;/code&gt; 拷贝到&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/etcd/ssl&lt;/code&gt;文件夹中。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;创建kube-apiserver使用的客户端token文件&lt;/p&gt;
+
+        &lt;p&gt;kubelet首次启动时向kube-apiserver发送TLS Bootstrapping请求，kube-apiserver 验证kubelet请求中的token是否与它配置的token.csv一致，&lt;br /&gt;
+ 如果一致则自动为 kubelet生成证书和秘钥。&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; # head -c 16 /dev/urandom | od -An -t x | tr -d ' '
+ 7ebc01f3b35182b41acaeecf12857088
+
+ # echo -n 7ebc01f3b35182b41acaeecf12857088,kubelet-bootstrap,10001,system:kubelet-bootstrap  &amp;gt; /etc/kubernetes/token.csv
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;创建api-server启动的static pod，编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/manifests/kube-apiserver.yaml&lt;/code&gt;:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-apiserver
+   namespace: kube-system
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-apiserver
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - apiserver
+     - --apiserver-count=3
+     - --bind-address=0.0.0.0
+     - --etcd-cafile=/etc/etcd/ssl/ca.pem
+     - --etcd-certfile=/etc/etcd/ssl/client.pem
+     - --etcd-keyfile=/etc/etcd/ssl/client-key.pem
+     - --etcd-servers=https://10.22.108.20:2379,https://10.22.108.79:2379,https://10.22.108.92:2379
+     - --allow-privileged=true
+     - --service-cluster-ip-range=10.99.66.0/23
+     - --secure-port=6443
+     - --advertise-address=10.22.108.20
+     - --admission-control=NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota
+     - --tls-cert-file=/etc/kubernetes/ssl/apiserver.pem
+     - --tls-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+     - --client-ca-file=/etc/kubernetes/ssl/ca.pem
+     - --service-account-key-file=/etc/kubernetes/ssl/ca-key.pem
+     - --authorization-mode=RBAC
+     - --experimental-bootstrap-token-auth
+     - --token-auth-file=/etc/kubernetes/token.csv
+     - --enable-swagger-ui=true
+     volumeMounts:
+     - mountPath: /etc/kubernetes/ssl
+       name: ssl-certs-kubernetes
+       readOnly: true
+     - mountPath: /etc/etcd/ssl
+       name: ssl-certs-etcd
+       readOnly: true
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+     - mountPath: /etc/kubernetes/token.csv
+       name: kubernetes-token
+   volumes:
+   - hostPath:
+       path: /etc/kubernetes/ssl
+     name: ssl-certs-kubernetes
+   - hostPath:
+       path: /etc/etcd/ssl
+     name: ssl-certs-etcd
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+   - hostPath:
+       path: /etc/kubernetes/token.csv
+     name: kubernetes-token
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;需要注意的是&lt;code class=&quot;highlighter-rouge&quot;&gt;--advertise-address=10.22.108.20&lt;/code&gt; 此处需要改成对应机器的IP，&lt;code class=&quot;highlighter-rouge&quot;&gt;--authorization-mode=RBAC&lt;/code&gt; 启用RBAC。&lt;/p&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kube-controller-manager&lt;/p&gt;
+
+    &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/manifests/kube-controll-manager.yaml&lt;/code&gt;:&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-controller-manager
+   namespace: kube-system
+   labels:
+     k8s-app: kube-controller-manager
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-controller-manager
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - controller-manager
+     - --master=http://127.0.0.1:8080
+     - --leader-elect=true
+     - --cluster-name=kubernetes
+     - --cluster-signing-cert-file=/etc/kubernetes/ssl/ca.pem
+     - --cluster-signing-key-file=/etc/kubernetes/ssl/ca-key.pem
+     - --service-account-private-key-file=/etc/kubernetes/ssl/ca-key.pem
+     - --root-ca-file=/etc/kubernetes/ssl/ca.pem
+     - --allocate-node-cidrs=true
+     - --cluster-cidr=10.20.0.0/16
+     - --node-cidr-mask-size=27
+     livenessProbe:
+       httpGet:
+         host: 127.0.0.1
+         path: /healthz
+         port: 10252
+       initialDelaySeconds: 15
+       timeoutSeconds: 1
+     volumeMounts:
+     - mountPath: /etc/kubernetes/ssl
+       name: ssl-certs-kubernetes
+       readOnly: true
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+     - mountPath: /dev/
+       name: dev
+     - mountPath: /etc/ceph/
+       name: cephconfig
+   volumes:
+   - hostPath:
+       path: /etc/kubernetes/ssl
+     name: ssl-certs-kubernetes
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+   - hostPath:
+       path: /etc/ceph
+     name: cephconfig
+   - hostPath:
+       path: /dev/
+     name: dev
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;此处&lt;code class=&quot;highlighter-rouge&quot;&gt;--allocate-node-cidrs=true、--cluster-cidr=10.20.0.0/16&lt;/code&gt; 将为每一个机器生成一个子网段，可以用来做IPAM。&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kube-scheduler&lt;/p&gt;
+
+    &lt;p&gt;编辑kube-scheduler的static pod的配置文件&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/kube-scheduler.yaml&lt;/code&gt;&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-scheduler
+   namespace: kube-system
+   labels:
+     k8s-app: kube-scheduler
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-scheduler
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - scheduler
+     - --master=http://127.0.0.1:8080
+     - --leader-elect=true
+     livenessProbe:
+       httpGet:
+         host: 127.0.0.1
+         path: /healthz
+         port: 10251
+       initialDelaySeconds: 15
+       timeoutSeconds: 1
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署kube-proxy&lt;/p&gt;
+
+    &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/kubernetes/kube-proxy.yaml&lt;/code&gt;:&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-proxy
+   namespace: kube-system
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-proxy
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - proxy
+     - --master=http://127.0.0.1:8080
+     - --hostname-override=10.22.108.20
+     - --cluster-cidr=10.99.66.0/23
+     securityContext:
+       privileged: true
+     volumeMounts:
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+   volumes:
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;需要把&lt;code class=&quot;highlighter-rouge&quot;&gt;--hostname-override=10.22.108.20&lt;/code&gt; 改成对应的IP地址&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署网络组建Flanneld&lt;/p&gt;
+
+    &lt;p&gt;flanneld可以&lt;a href=&quot;https://github.com/coreos/flannel/tree/master/Documentation&quot;&gt;通过kubernetes的daemonset部署在容器里面&lt;/a&gt;。
+ 为了避免因docker daemon重启带来的风险，我们把他部署在宿主机上，采用systemd unit启动。&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;生成flanneld访问etcd的证书。&lt;/p&gt;
+
+        &lt;p&gt;编辑flannel.json:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;CN&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;flannel&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;hosts&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;key&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;algo&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;rsa&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;size&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;2048&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;},&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;names&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+             &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;O&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;ETCD&quot;&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;执行命令：&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client flannel.json | cfssljson -bare flannel
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;将生成的证书&lt;code class=&quot;highlighter-rouge&quot;&gt;flannel.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;flannel-key.pem&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;ca.pem&lt;/code&gt; 放到&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/flannel/ssl&lt;/code&gt;下面。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;编辑flanneld的systemd unit,&lt;code class=&quot;highlighter-rouge&quot;&gt;/lib/systemd/system/flanneld.service&lt;/code&gt;:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; [Service]
+ ExecStart=/opt/bin/flanneld \
+    -iface enp4s0f0 \
+    -etcd-cafile=/etc/flannel/ssl/ca.pem \
+    -etcd-certfile=/etc/flannel/ssl/flannel.pem \
+    -etcd-keyfile=/etc/flannel/ssl/flannel-key.pem \
+    -etcd-endpoints=&quot;https://10.22.108.20:2379,https://10.22.108.79:2379,https://10.22.108.92:2379&quot; \
+    -etcd-prefix=&quot;/coreos.com/network&quot; \
+    -ip-masq
+ Restart=always
+ RestartSec=10
+ [Install]
+ WantedBy=multi-user.target
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;需要把&lt;code class=&quot;highlighter-rouge&quot;&gt;-iface enp4s0f0&lt;/code&gt; 改成对应的网卡名字，使用&lt;code class=&quot;highlighter-rouge&quot;&gt;systemctl start flanneld&lt;/code&gt;启动flanneld。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;在etcd中加入flanneld的配置项&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; etcdctl \
+   --endpoints=https://10.22.108.20:2379/ \
+   --ca-file=/etc/flannel/ssl/ca.pem  \
+   --cert-file=/etc/flannel/ssl/flannel.pem  \
+   --key-file=/etc/flannel/ssl/flannel-key.pem  \
+   set /coreos.com/network/config \
+   '{&quot;Network&quot;:&quot;10.100.0.0/16&quot;, &quot;SubnetLen&quot;: 27, &quot;Backend&quot;: {&quot;Type&quot;: &quot;vxlan&quot;}}'
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;部署CNI&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;下载CNI&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; mkdir -p /opt/cni/bin/
+ wget https://github.com/containernetworking/cni/releases/download/v0.6.0/cni-amd64-v0.6.0.tgz -O - |tar -zxpvf - -C /opt/cni/bin/
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;编辑CNI配置&lt;/p&gt;
+
+        &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;/etc/cni/net.d/10-containers.conf&lt;/code&gt;:&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;name&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;cbr0&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;type&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;flannel&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;delegate&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+         &lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&quot;isDefaultGateway&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;&lt;span class=&quot;w&quot;&gt; &lt;/span&gt;&lt;span class=&quot;kc&quot;&gt;true&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+     &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;w&quot;&gt;
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;至此master节点就配置完成了。使用&lt;code class=&quot;highlighter-rouge&quot;&gt;systemctl enable kubelet flanneld&lt;/code&gt; 确保服务开机自启。
+如果遇到无法获取gcr.io的镜像，可以绑定hosts &lt;code class=&quot;highlighter-rouge&quot;&gt;216.58.220.192 gcr.io&lt;/code&gt;。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（2. Ceph）</title>
+        <description>&lt;p&gt;本例中使用5个机器部署ceph&lt;code class=&quot;highlighter-rouge&quot;&gt;/dev/sdb&lt;/code&gt;作为osd使用的分区，使用ceph-deploy搭建了简易的ceph集群。   &lt;br /&gt;
+该Ceph集群用来存储包括docker镜像仓库，prometheus的监控数据等。&lt;br /&gt;
+使用kubernetes的StorageClass对接ceph，使得ceph的rdb可以作为数据卷挂载给Pod使用。&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;安装ceph-deploy&lt;/p&gt;
+
+    &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; apt-get install python-pip virtualenv
+ virtualenv ~/.env
+ source ~/.env/bin/activate
+ pip install ceph-deploy --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;使用ceph-deploy安装ceph&lt;/p&gt;
+
+    &lt;p&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;注意：&lt;/code&gt; 安装ceph要求mon节点时间要同步，可以先配置好ntpd做时间同步。采用命令&lt;code class=&quot;highlighter-rouge&quot;&gt;timedatectl status&lt;/code&gt;或者&lt;code class=&quot;highlighter-rouge&quot;&gt;ntpq -p&lt;/code&gt;查看同步状态。&lt;/p&gt;
+
+    &lt;ol&gt;
+      &lt;li&gt;
+        &lt;p&gt;首先编辑5台机器的hosts文件加入如下内容&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; 10.22.108.20 kube-system-0
+ 10.22.108.21 kube-system-1
+ 10.22.108.22 kube-system-2
+ 10.22.108.23 kube-system-3
+ 10.22.108.24 kube-system-4
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;配置好ssh验证&lt;/p&gt;
+
+        &lt;p&gt;编辑&lt;code class=&quot;highlighter-rouge&quot;&gt;~/.ssh/config&lt;/code&gt;加入如下内容&lt;/p&gt;
+
+        &lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; StrictHostKeyChecking no
+ UserKnownHostsFile /dev/null
+
+ Host kube-system-*
+     Port 22
+     User root
+
+ Host 10.22.108.*
+     Port 22
+     User root
+&lt;/code&gt;&lt;/pre&gt;
+        &lt;/div&gt;
+
+        &lt;p&gt;配置ssh公钥登录并执行&lt;code class=&quot;highlighter-rouge&quot;&gt;ssh kube-system-1&lt;/code&gt;测试是否能正常登录。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;安装ceph软件包&lt;/p&gt;
+
+        &lt;p&gt;执行命令：&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-deploy install --repo-url https://mirrors.ustc.edu.cn/ceph/debian-jewel kubernetes-{0..4}&lt;/code&gt;&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;部署ceph mon节点&lt;/p&gt;
+
+        &lt;p&gt;执行命令：&lt;br /&gt;
+ &lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-deploy --cluster ceph new kube-system-{0..4} --public-network=10.22.108.0/23 --private-network=10.22.108.0/23&lt;/code&gt;&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;部署osd&lt;/p&gt;
+
+        &lt;p&gt;执行命令：&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-deploy osd create kube-system-{0..4}:/dev/sdb&lt;/code&gt;创建osd, &lt;br /&gt;
+ 然后在执行:&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-deploy osd activate kube-system-{0..4}&lt;/code&gt;应用osd。&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;部署管理节点&lt;/p&gt;
+
+        &lt;p&gt;执行命令: &lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-deploy admin kube-system-{0..4}&lt;/code&gt;，执行&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph -s &lt;/code&gt;查看集群运行状态。&lt;/p&gt;
+      &lt;/li&gt;
+    &lt;/ol&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;创建供给kubernetes使用的pool&lt;/p&gt;
+
+    &lt;p&gt;执行命令&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph --cluster ceph osd create kube 1024 1024&lt;/code&gt;&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;导入ceph的key到kubernetes集群中去&lt;/p&gt;
+
+    &lt;p&gt;将ceph的admin-key到k8s中去，作为secret导入kube-system这个namespace中&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; kubectl create secret generic ceph-secret --type&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes.io/rbd&quot;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+     --from-literal&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;key&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;sb&quot;&gt;`&lt;/span&gt;ceph --cluster ceph auth get-key client.admin&lt;span class=&quot;sb&quot;&gt;`&lt;/span&gt;  --namespace&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;kube-system
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;创建client.kube并将key导入到各个需要使用rbd的namespaces中&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ceph --cluster ceph auth get-or-create client.kube mon &lt;span class=&quot;s1&quot;&gt;'allow r'&lt;/span&gt; osd &lt;span class=&quot;s1&quot;&gt;'allow rwx pool=kube'&lt;/span&gt;
+ kubectl create secret generic ceph-secret-kube --type&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;kubernetes.io/rbd&quot;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+     --from-literal&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;key&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;sb&quot;&gt;`&lt;/span&gt;ceph --cluster ceph auth get-key client.kube&lt;span class=&quot;sb&quot;&gt;`&lt;/span&gt; --namespace&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;default
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;创建StorageClass&lt;/p&gt;
+
+    &lt;p&gt;编辑rbd-storgaeclass.yaml：&lt;/p&gt;
+
+    &lt;div class=&quot;language-yaml highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;s&quot;&gt;kind&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;StorageClass&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;metadata&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;standard&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;annotations&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;storageclass.kubernetes.io/is-default-class&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;true&quot;&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;provisioner&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;kubernetes.io/rbd&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;parameters&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;monitors&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;10.22.108.20:6789,10.22.108.21:6789,10.22.108.22:6789,10.22.108.23:6789,10.22.108.24:6789&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;adminId&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;admin&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;adminSecretName&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;ceph-secret&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;adminSecretNamespace&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;kube-system&quot;&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;pool&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;kube&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;userId&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;kube&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;userSecretName&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;ceph-secret-kube&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;使用ceph&lt;/p&gt;
+
+    &lt;p&gt;首先需要在各个k8s节点中安装&lt;code class=&quot;highlighter-rouge&quot;&gt;ceph-common&lt;/code&gt;,如果kube-controller-manager部署在容器中，需要基础镜像安装了ceph-common。&lt;br /&gt;
+ coreos提供的hyperkube的镜像&lt;code class=&quot;highlighter-rouge&quot;&gt;quay.io/coreos/hyperkube:v1.7.3_coreos.0&lt;/code&gt;就包含了ceph-common，可以考虑使用此镜像部署kubernetes。&lt;/p&gt;
+
+    &lt;p&gt;创建kubernetes的pvc&lt;/p&gt;
+
+    &lt;div class=&quot;language-yaml highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;s&quot;&gt;apiVersion&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;v1&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;kind&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;PersistentVolumeClaim&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;metadata&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-storage&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;namespace&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;default&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;spec&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;accessModes&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;pi&quot;&gt;-&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;ReadWriteOnce&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;resources&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;requests&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;storage&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;100Gi&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;storageClassName&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;standard&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;创建好之后k8s会根据kubernetes会根据pvc模版创建相对应的pv，使用&lt;code class=&quot;highlighter-rouge&quot;&gt;kubectl get pv&lt;/code&gt;查看。&lt;br /&gt;
+ 使用&lt;code class=&quot;highlighter-rouge&quot;&gt;kubectl describe pv &amp;lt;PVNAME&amp;gt;&lt;/code&gt;可以获取到pv对应的ceph/rbd。&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;c&quot;&gt;# kubectl describe pv pvc-01b09435-7b49-11e7-8938-1866da9e3d4b&lt;/span&gt;
+    
+ Name:  pvc-01b09435-7b49-11e7-8938-1866da9e3d4b
+ Labels:  &amp;lt;none&amp;gt;
+ Annotations:  kubernetes.io/createdby&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;rbd-dynamic-provisioner
+   pv.kubernetes.io/bound-by-controller&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;yes
+   pv.kubernetes.io/provisioned-by&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;kubernetes.io/rbd
+ StorageClass:  standard
+ Status:  Bound
+ Claim:  default/metadata-storage
+ Reclaim Policy:  Delete
+ Access Modes:  RWO
+ Capacity:  100Gi
+ Message:
+ Source:
+   Type:  RBD &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;a Rados Block Device mount on the host that shares a pod&lt;span class=&quot;s1&quot;&gt;'s lifetime)
+   CephMonitors:  [10.22.108.20:6789 10.22.108.21:6789 10.22.108.22:6789 10.22.108.23:6789 10.22.108.24:6789]
+   RBDImage:  kubernetes-dynamic-pvc-01b2719f-7b49-11e7-8bd4-1866da9e3d4b
+   FSType:
+   RBDPool:  kube
+   RadosUser:  kube
+   Keyring:  /etc/ceph/keyring
+   SecretRef:  &amp;amp;{ceph-secret-kube}
+   ReadOnly:  false
+ Events:    &amp;lt;none&amp;gt;
+    
+ # rbd ls kube |grep kubernetes-dynamic-pvc-01b2719f-7b49-11e7-8bd4-1866da9e3d4b
+ kubernetes-dynamic-pvc-01b2719f-7b49-11e7-8bd4-1866da9e3d4b
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;然后创建pod使用pv&lt;/p&gt;
+
+    &lt;div class=&quot;language-yaml highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;s&quot;&gt;kind&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;Deployment&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;metadata&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;labels&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;run&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-server&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-server&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;namespace&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;default&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;spec&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;replicas&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;1&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;selector&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;matchLabels&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;run&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-server&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;strategy&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;rollingUpdate&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;maxSurge&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;1&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;maxUnavailable&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;1&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;type&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;RollingUpdate&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;template&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;metadata&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;labels&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+         &lt;span class=&quot;s&quot;&gt;run&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-server&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;spec&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;containers&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;pi&quot;&gt;-&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;image&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;nginx:alpine&lt;/span&gt;
+         &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-server&lt;/span&gt;
+         &lt;span class=&quot;s&quot;&gt;volumeMounts&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+         &lt;span class=&quot;pi&quot;&gt;-&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;mountPath&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;/usr/share/nginx/html&lt;/span&gt;
+           &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-storage&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;volumes&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;pi&quot;&gt;-&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-storage&lt;/span&gt;
+         &lt;span class=&quot;s&quot;&gt;persistentVolumeClaim&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+           &lt;span class=&quot;s&quot;&gt;claimName&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata-storage&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;等到pod启动成功，到pod调度的机器上面可以看到对应的rbd已经格式化并挂载好了。&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; mount | grep pvc-01b09435-7b49-11e7-8938-1866da9e3d4b
+ /dev/rbd2 on /var/lib/kubelet/pods/41104258-88df-11e7-a533-1866daa4fa2f/volumes/kubernetes.io~rbd/pvc-01b09435-7b49-11e7-8938-1866da9e3d4b &lt;span class=&quot;nb&quot;&gt;type &lt;/span&gt;ext4 &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;rw,relatime,stripe&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;1024,data&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;ordered&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+
+    &lt;p&gt;如果应用采用statefulset的方式部署，则可以不用先创建pvc，直接在statefulset的模版里面指定volumeClaimTemplates:&lt;/p&gt;
+
+    &lt;div class=&quot;language-yaml highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;s&quot;&gt;volumeClaimTemplates&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+ &lt;span class=&quot;pi&quot;&gt;-&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;metadata&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;prometheus-k8s-db&lt;/span&gt;
+ &lt;span class=&quot;s&quot;&gt;spec&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;accessModes&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+   &lt;span class=&quot;pi&quot;&gt;-&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;ReadWriteOnce&lt;/span&gt;
+   &lt;span class=&quot;s&quot;&gt;resources&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+     &lt;span class=&quot;s&quot;&gt;requests&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt;
+       &lt;span class=&quot;s&quot;&gt;storage&lt;/span&gt;&lt;span class=&quot;pi&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;1Ti&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;至此ceph部署和在kubernetes 中的应用就介绍完了。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html</guid>
+      </item>
+    
+      <item>
+        <title>kubernetes集群搭建（1. docker）</title>
+        <description>&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;操作系统&lt;/p&gt;
+
+    &lt;ul&gt;
+      &lt;li&gt;
+        &lt;p&gt;系统选择：Ubuntu 16.04.2 LTS, 内核版本4.10.0-27-generic&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;安装操作系统： 尽量保持&lt;code class=&quot;highlighter-rouge&quot;&gt;/var/&lt;/code&gt;是最大的分区，docker和kubernete 的数据默认保存在此分区，采用xfs文件系统。
+ 如果&lt;code class=&quot;highlighter-rouge&quot;&gt;/var/&lt;/code&gt;分区较小需要改变docker启动参数指定数据所在目录，例如：&lt;code class=&quot;highlighter-rouge&quot;&gt;-g /home/docker&lt;/code&gt;&lt;/p&gt;
+      &lt;/li&gt;
+      &lt;li&gt;
+        &lt;p&gt;操作系统调优：做好操作系统基本的调优比如&lt;code class=&quot;highlighter-rouge&quot;&gt;内核参数调优&lt;/code&gt;，&lt;code class=&quot;highlighter-rouge&quot;&gt;设置ulimit&lt;/code&gt;，&lt;code class=&quot;highlighter-rouge&quot;&gt;网卡软中断绑定&lt;/code&gt;等。&lt;/p&gt;
+      &lt;/li&gt;
+    &lt;/ul&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;安装docker&lt;/p&gt;
+
+    &lt;p&gt;参照&lt;a href=&quot;https://docs.docker.com/engine/installation/linux/docker-ce/ubuntu/&quot;&gt;Docker官方&lt;/a&gt;提供的方法安装docker-ce最新版本。&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; sudo apt-get install &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ apt-transport-https &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ ca-certificates &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ curl &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ software-properties-common
+
+ curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+
+ &lt;span class=&quot;c&quot;&gt;#可以使用第三方的镜像提高安装速度&lt;/span&gt;
+ sudo add-apt-repository &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ &lt;span class=&quot;s2&quot;&gt;&quot;deb [arch=amd64] http://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu &lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;
+ &lt;/span&gt;&lt;span class=&quot;k&quot;&gt;$(&lt;/span&gt;lsb_release -cs&lt;span class=&quot;k&quot;&gt;)&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt; &lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;
+ stable&quot;&lt;/span&gt;
+
+ sudo apt-get update
+ sudo apt-get install docker-ce
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+    &lt;p&gt;由于内核版本较新可以更改dockerd的启动参数采用overlay2驱动,&lt;br /&gt;
+ 使用命令&lt;code class=&quot;highlighter-rouge&quot;&gt;sudo systemdctl edit docker&lt;/code&gt;编辑docker的启动参数，更改之后的内容为：&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;Service]
+ &lt;span class=&quot;nv&quot;&gt;ExecStart&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;
+ &lt;span class=&quot;nv&quot;&gt;ExecStart&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/usr/bin/dockerd -H fd:// -s overlay2
+&lt;/code&gt;&lt;/pre&gt;
+    &lt;/div&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;至此，宿主机docker相关环境就准备完成了。&lt;/p&gt;
+</description>
+        <pubDate>Tue, 19 Sep 2017 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/kubernetes/docker/2017/09/19/kubernetes-cluster-01-docker.html</link>
+        <guid isPermaLink="true">http://localhost:4000/kubernetes/docker/2017/09/19/kubernetes-cluster-01-docker.html</guid>
+      </item>
+    
+  </channel>
+</rss>

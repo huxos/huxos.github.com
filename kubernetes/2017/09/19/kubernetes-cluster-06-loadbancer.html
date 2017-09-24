@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（6. loadbancer）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-06-loadbancer.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（6. loadbancer）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<blockquote>
+  <p>kubernetes在定义Service的时候提供了LoadBalancer类型，用于集群外部访问到kubernetes的服务。<br />
+但是这里的LoadBalancer主要对接用云服务商提供的负载均衡服务，在物理机部署的环境就不是很适用了。<br />
+结合kubernetes本身的Service就提供了负载均衡的功能，想到一个巧妙的方法: 把Service的Cluster IP做成可以在集群外部可以路由。<br />
+可以在交换机上面配置等价路由，将Cluster IP段路由到kube-proxy的节点就行了，这种方式最多支持8个节点做集群的负载均衡。<br />
+考虑到kube-proxy的冗长的iptables规则，当service的数目多了之后性能上会存在问题，所以采用kube-router作为负载均衡节点。<br />
+kube-router基于IPVS实现，转发效率上会更高，规则可读性也会更好。<br />
+如果集群网络是采用overlay，那么这种方式的可能的瓶颈在与做负载均衡的节点对集群内外的流量解封包的过程，小规模使用起来应该是没有问题。</p>
+</blockquote>
+
+<blockquote>
+  <p>另外即将发布的kubernetes 1.8中kube-proxy原生就支持IPVS，到时可以少引入kube-router这依赖了。</p>
+</blockquote>
+
+<p><a href="https://github.com/cloudnativelabs/kube-router">kube-router</a> A distributed load balancer, firewall and router designed for Kubernetes。</p>
+
+<p>根据官网的介绍kube-router有三个部分组成</p>
+
+<ul>
+  <li>
+    <p>第一部分：<code class="highlighter-rouge">--run-service-proxy</code> 基于IPVS的负载均衡器（IPVS/LVS based service proxy）可用于替换掉kube-proxy，用作kubenetes中的service的负载均衡。</p>
+  </li>
+  <li>
+    <p>第二部分：<code class="highlighter-rouge">--run-router</code> 基于BGP实现的跨主机网络（Pod Networking）</p>
+  </li>
+  <li>
+    <p>第三部分：<code class="highlighter-rouge">--run-firewall</code> 网络访问策略控制器（Network Policy Controller），基于ipset和iptables实现。</p>
+  </li>
+</ul>
+
+<p>我们仅使用其了service-proxy的功能。<br />
+本例部署在10.22.108.100、10.22.108.101 这两个机器上。<br />
+服务启动之后会使用ClusterIP配置LVS的virtual server，并且在新增虚拟网口上绑定ClusterIP，设置好ipvs的规则，通过LVS使用nat方式将流量转发到容器中。<br />
+我们在上层交换机上指定两条等价路由，将ClusterIP的地址段指向这两个机器，并且做好存活检测。</p>
+
+<h4 id="部署步骤">部署步骤</h4>
+
+<ol>
+  <li>
+    <p>到入kube-router使用的rbac规则</p>
+
+    <p>为了简化操作我们让<code class="highlighter-rouge">kube-router</code>使用前篇<a href="http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-04-kube-node.html">kubernetes集群搭建（4. kube node）</a>
+ 中创建的<code class="highlighter-rouge">proxy-kubeconfig.yaml</code>来访问apiserver。<br />
+ 需要创建好kube-router需要的RBAC规则授权给<code class="highlighter-rouge">system:kube-proxy</code>这个用户。</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kind: ClusterRole
+ apiVersion: rbac.authorization.k8s.io/v1beta1
+ metadata:
+   name: kube-router
+   namespace: kube-system
+ rules:
+   - apiGroups:
+     - ""
+     resources:
+       - namespaces
+       - pods
+       - services
+       - nodes
+       - endpoints
+     verbs:
+       - list
+       - get
+       - watch
+   - apiGroups:
+     - "networking.k8s.io"
+     resources:
+       - networkpolicies
+     verbs:
+       - list
+       - get
+       - watch
+   - apiGroups:
+     - extensions
+     resources:
+       - networkpolicies
+     verbs:
+       - get
+       - list
+       - watch
+ ---
+ kind: ClusterRoleBinding
+ apiVersion: rbac.authorization.k8s.io/v1beta1
+ metadata:
+   name: kube-router
+ roleRef:
+   apiGroup: rbac.authorization.k8s.io
+   kind: ClusterRole
+   name: kube-router
+ subjects:
+ - kind: User
+   name: system:kube-proxy
+   namespace: kube-system
+</code></pre>
+    </div>
+
+    <p>将proxy-kubeconfig.yaml拷贝到两个机器的<code class="highlighter-rouge">/etc/kubernetes/</code>目录。</p>
+  </li>
+  <li>
+    <p>创建kube-router的Daemonset</p>
+
+    <p>我们创建kube-router的调度模版，将kube-router调度到label为<code class="highlighter-rouge">role=lb</code> 的机器上。<br />
+ 需要把<code class="highlighter-rouge">/etc/kubernetes/proxy-kubeconfig.yaml</code>挂载到容器中，kube-router会读取此文件的配置访问apiserver。<br />
+ 需要特权模式运行，并且把<code class="highlighter-rouge">/lib/modules</code>挂载到容器中。</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: extensions/v1beta1
+ kind: DaemonSet
+ metadata:
+   labels:
+     k8s-app: kube-router
+   name: kube-router
+   namespace: kube-system
+ spec:
+   revisionHistoryLimit: 10
+   selector:
+     matchLabels:
+       k8s-app: kube-router
+   template:
+     metadata:
+       annotations:
+         scheduler.alpha.kubernetes.io/critical-pod: ""
+       labels:
+         k8s-app: kube-router
+     spec:
+       containers:
+       - args:
+         - --kubeconfig=/var/lib/kube-router/kubeconfig
+         - --run-service-proxy=true
+         - --run-router=false
+         - --run-firewall=false
+         env:
+         - name: NODE_NAME
+           valueFrom:
+             fieldRef:
+               apiVersion: v1
+               fieldPath: spec.nodeName
+         image: cloudnativelabs/kube-router:v0.0.12
+         imagePullPolicy: IfNotPresent
+         name: kube-router
+         securityContext:
+           privileged: true
+         volumeMounts:
+         - mountPath: /lib/modules
+           name: lib-modules
+           readOnly: true
+         - mountPath: /var/lib/kube-router/kubeconfig
+           name: kubeconfig
+       dnsPolicy: ClusterFirst
+       hostNetwork: true
+       nodeSelector:
+         role: lb
+       restartPolicy: Always
+       volumes:
+       - hostPath:
+           path: /lib/modules
+         name: lib-modules
+       - hostPath:
+           path: /etc/kubernetes/proxy-kubeconfig.yaml
+         name: kubeconfig
+</code></pre>
+    </div>
+
+    <p>为两个机器打上相应的label，等待启动成功我们可以是用<code class="highlighter-rouge">ipvsadm -Ln</code>来查看规则是否生效。</p>
+  </li>
+  <li>
+    <p>创建SNAT规则</p>
+
+    <p>等待上面的容器启动之后发现不能正常工作，经查发现IPVS实现了DNAT，只对目的地址执行了转换，要使得POD正常回包，还需要再设置SNAT。</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> iptables -t nat -A POSTROUTING -m ipvs --vdir ORIGINAL --vmethod MASQ -m comment --comment "ipvs snat rule" -j MASQUERADE
+</code></pre>
+    </div>
+
+    <p>这点有点像Full NAT模式，只不过SNAT由iptables完成的。</p>
+  </li>
+  <li>
+    <p>配置交换机等价路由</p>
+
+    <p>最后需要在交换机上面配置好等价路由将clusterIP段 10.99.66.0/23 路由到这两个机器上就行了。</p>
+  </li>
+</ol>
+
+<p>至此基于IPVS的和ClusterIP的负载均衡就搭建完成了。</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（6. loadbancer） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

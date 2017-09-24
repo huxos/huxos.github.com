@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（2. Ceph）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（2. Ceph）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<p>本例中使用5个机器部署ceph<code class="highlighter-rouge">/dev/sdb</code>作为osd使用的分区，使用ceph-deploy搭建了简易的ceph集群。   <br />
+该Ceph集群用来存储包括docker镜像仓库，prometheus的监控数据等。<br />
+使用kubernetes的StorageClass对接ceph，使得ceph的rdb可以作为数据卷挂载给Pod使用。</p>
+
+<ol>
+  <li>
+    <p>安装ceph-deploy</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> apt-get install python-pip virtualenv
+ virtualenv ~/.env
+ source ~/.env/bin/activate
+ pip install ceph-deploy --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>使用ceph-deploy安装ceph</p>
+
+    <p><code class="highlighter-rouge">注意：</code> 安装ceph要求mon节点时间要同步，可以先配置好ntpd做时间同步。采用命令<code class="highlighter-rouge">timedatectl status</code>或者<code class="highlighter-rouge">ntpq -p</code>查看同步状态。</p>
+
+    <ol>
+      <li>
+        <p>首先编辑5台机器的hosts文件加入如下内容</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> 10.22.108.20 kube-system-0
+ 10.22.108.21 kube-system-1
+ 10.22.108.22 kube-system-2
+ 10.22.108.23 kube-system-3
+ 10.22.108.24 kube-system-4
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>配置好ssh验证</p>
+
+        <p>编辑<code class="highlighter-rouge">~/.ssh/config</code>加入如下内容</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> StrictHostKeyChecking no
+ UserKnownHostsFile /dev/null
+
+ Host kube-system-*
+     Port 22
+     User root
+
+ Host 10.22.108.*
+     Port 22
+     User root
+</code></pre>
+        </div>
+
+        <p>配置ssh公钥登录并执行<code class="highlighter-rouge">ssh kube-system-1</code>测试是否能正常登录。</p>
+      </li>
+      <li>
+        <p>安装ceph软件包</p>
+
+        <p>执行命令：<code class="highlighter-rouge">ceph-deploy install --repo-url https://mirrors.ustc.edu.cn/ceph/debian-jewel kubernetes-{0..4}</code></p>
+      </li>
+      <li>
+        <p>部署ceph mon节点</p>
+
+        <p>执行命令：<br />
+ <code class="highlighter-rouge">ceph-deploy --cluster ceph new kube-system-{0..4} --public-network=10.22.108.0/23 --private-network=10.22.108.0/23</code></p>
+      </li>
+      <li>
+        <p>部署osd</p>
+
+        <p>执行命令：<code class="highlighter-rouge">ceph-deploy osd create kube-system-{0..4}:/dev/sdb</code>创建osd, <br />
+ 然后在执行:<code class="highlighter-rouge">ceph-deploy osd activate kube-system-{0..4}</code>应用osd。</p>
+      </li>
+      <li>
+        <p>部署管理节点</p>
+
+        <p>执行命令: <code class="highlighter-rouge">ceph-deploy admin kube-system-{0..4}</code>，执行<code class="highlighter-rouge">ceph -s </code>查看集群运行状态。</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>创建供给kubernetes使用的pool</p>
+
+    <p>执行命令<code class="highlighter-rouge">ceph --cluster ceph osd create kube 1024 1024</code></p>
+  </li>
+  <li>
+    <p>导入ceph的key到kubernetes集群中去</p>
+
+    <p>将ceph的admin-key到k8s中去，作为secret导入kube-system这个namespace中</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> kubectl create secret generic ceph-secret --type<span class="o">=</span><span class="s2">"kubernetes.io/rbd"</span> <span class="se">\</span>
+     --from-literal<span class="o">=</span><span class="nv">key</span><span class="o">=</span><span class="sb">`</span>ceph --cluster ceph auth get-key client.admin<span class="sb">`</span>  --namespace<span class="o">=</span>kube-system
+</code></pre>
+    </div>
+
+    <p>创建client.kube并将key导入到各个需要使用rbd的namespaces中</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> ceph --cluster ceph auth get-or-create client.kube mon <span class="s1">'allow r'</span> osd <span class="s1">'allow rwx pool=kube'</span>
+ kubectl create secret generic ceph-secret-kube --type<span class="o">=</span><span class="s2">"kubernetes.io/rbd"</span> <span class="se">\</span>
+     --from-literal<span class="o">=</span><span class="nv">key</span><span class="o">=</span><span class="sb">`</span>ceph --cluster ceph auth get-key client.kube<span class="sb">`</span> --namespace<span class="o">=</span>default
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>创建StorageClass</p>
+
+    <p>编辑rbd-storgaeclass.yaml：</p>
+
+    <div class="language-yaml highlighter-rouge"><pre class="highlight"><code> <span class="s">kind</span><span class="pi">:</span> <span class="s">StorageClass</span>
+ <span class="s">metadata</span><span class="pi">:</span>
+   <span class="s">name</span><span class="pi">:</span> <span class="s">standard</span>
+   <span class="s">annotations</span><span class="pi">:</span>
+     <span class="s">storageclass.kubernetes.io/is-default-class</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
+ <span class="s">provisioner</span><span class="pi">:</span> <span class="s">kubernetes.io/rbd</span>
+ <span class="s">parameters</span><span class="pi">:</span>
+   <span class="s">monitors</span><span class="pi">:</span> <span class="s">10.22.108.20:6789,10.22.108.21:6789,10.22.108.22:6789,10.22.108.23:6789,10.22.108.24:6789</span>
+   <span class="s">adminId</span><span class="pi">:</span> <span class="s">admin</span>
+   <span class="s">adminSecretName</span><span class="pi">:</span> <span class="s">ceph-secret</span>
+   <span class="s">adminSecretNamespace</span><span class="pi">:</span> <span class="s2">"</span><span class="s">kube-system"</span>
+   <span class="s">pool</span><span class="pi">:</span> <span class="s">kube</span>
+   <span class="s">userId</span><span class="pi">:</span> <span class="s">kube</span>
+   <span class="s">userSecretName</span><span class="pi">:</span> <span class="s">ceph-secret-kube</span>
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>使用ceph</p>
+
+    <p>首先需要在各个k8s节点中安装<code class="highlighter-rouge">ceph-common</code>,如果kube-controller-manager部署在容器中，需要基础镜像安装了ceph-common。<br />
+ coreos提供的hyperkube的镜像<code class="highlighter-rouge">quay.io/coreos/hyperkube:v1.7.3_coreos.0</code>就包含了ceph-common，可以考虑使用此镜像部署kubernetes。</p>
+
+    <p>创建kubernetes的pvc</p>
+
+    <div class="language-yaml highlighter-rouge"><pre class="highlight"><code> <span class="s">apiVersion</span><span class="pi">:</span> <span class="s">v1</span>
+ <span class="s">kind</span><span class="pi">:</span> <span class="s">PersistentVolumeClaim</span>
+ <span class="s">metadata</span><span class="pi">:</span>
+   <span class="s">name</span><span class="pi">:</span> <span class="s">metadata-storage</span>
+   <span class="s">namespace</span><span class="pi">:</span> <span class="s">default</span>
+ <span class="s">spec</span><span class="pi">:</span>
+   <span class="s">accessModes</span><span class="pi">:</span>
+   <span class="pi">-</span> <span class="s">ReadWriteOnce</span>
+   <span class="s">resources</span><span class="pi">:</span>
+     <span class="s">requests</span><span class="pi">:</span>
+       <span class="s">storage</span><span class="pi">:</span> <span class="s">100Gi</span>
+   <span class="s">storageClassName</span><span class="pi">:</span> <span class="s">standard</span>
+</code></pre>
+    </div>
+
+    <p>创建好之后k8s会根据kubernetes会根据pvc模版创建相对应的pv，使用<code class="highlighter-rouge">kubectl get pv</code>查看。<br />
+ 使用<code class="highlighter-rouge">kubectl describe pv &lt;PVNAME&gt;</code>可以获取到pv对应的ceph/rbd。</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> <span class="c"># kubectl describe pv pvc-01b09435-7b49-11e7-8938-1866da9e3d4b</span>
+    
+ Name:  pvc-01b09435-7b49-11e7-8938-1866da9e3d4b
+ Labels:  &lt;none&gt;
+ Annotations:  kubernetes.io/createdby<span class="o">=</span>rbd-dynamic-provisioner
+   pv.kubernetes.io/bound-by-controller<span class="o">=</span>yes
+   pv.kubernetes.io/provisioned-by<span class="o">=</span>kubernetes.io/rbd
+ StorageClass:  standard
+ Status:  Bound
+ Claim:  default/metadata-storage
+ Reclaim Policy:  Delete
+ Access Modes:  RWO
+ Capacity:  100Gi
+ Message:
+ Source:
+   Type:  RBD <span class="o">(</span>a Rados Block Device mount on the host that shares a pod<span class="s1">'s lifetime)
+   CephMonitors:  [10.22.108.20:6789 10.22.108.21:6789 10.22.108.22:6789 10.22.108.23:6789 10.22.108.24:6789]
+   RBDImage:  kubernetes-dynamic-pvc-01b2719f-7b49-11e7-8bd4-1866da9e3d4b
+   FSType:
+   RBDPool:  kube
+   RadosUser:  kube
+   Keyring:  /etc/ceph/keyring
+   SecretRef:  &amp;{ceph-secret-kube}
+   ReadOnly:  false
+ Events:    &lt;none&gt;
+    
+ # rbd ls kube |grep kubernetes-dynamic-pvc-01b2719f-7b49-11e7-8bd4-1866da9e3d4b
+ kubernetes-dynamic-pvc-01b2719f-7b49-11e7-8bd4-1866da9e3d4b
+</span></code></pre>
+    </div>
+
+    <p>然后创建pod使用pv</p>
+
+    <div class="language-yaml highlighter-rouge"><pre class="highlight"><code> <span class="s">kind</span><span class="pi">:</span> <span class="s">Deployment</span>
+ <span class="s">metadata</span><span class="pi">:</span>
+ <span class="s">labels</span><span class="pi">:</span>
+   <span class="s">run</span><span class="pi">:</span> <span class="s">metadata-server</span>
+ <span class="s">name</span><span class="pi">:</span> <span class="s">metadata-server</span>
+ <span class="s">namespace</span><span class="pi">:</span> <span class="s">default</span>
+ <span class="s">spec</span><span class="pi">:</span>
+   <span class="s">replicas</span><span class="pi">:</span> <span class="s">1</span>
+   <span class="s">selector</span><span class="pi">:</span>
+     <span class="s">matchLabels</span><span class="pi">:</span>
+       <span class="s">run</span><span class="pi">:</span> <span class="s">metadata-server</span>
+   <span class="s">strategy</span><span class="pi">:</span>
+     <span class="s">rollingUpdate</span><span class="pi">:</span>
+       <span class="s">maxSurge</span><span class="pi">:</span> <span class="s">1</span>
+       <span class="s">maxUnavailable</span><span class="pi">:</span> <span class="s">1</span>
+     <span class="s">type</span><span class="pi">:</span> <span class="s">RollingUpdate</span>
+   <span class="s">template</span><span class="pi">:</span>
+     <span class="s">metadata</span><span class="pi">:</span>
+       <span class="s">labels</span><span class="pi">:</span>
+         <span class="s">run</span><span class="pi">:</span> <span class="s">metadata-server</span>
+     <span class="s">spec</span><span class="pi">:</span>
+       <span class="s">containers</span><span class="pi">:</span>
+       <span class="pi">-</span> <span class="s">image</span><span class="pi">:</span> <span class="s">nginx:alpine</span>
+         <span class="s">name</span><span class="pi">:</span> <span class="s">metadata-server</span>
+         <span class="s">volumeMounts</span><span class="pi">:</span>
+         <span class="pi">-</span> <span class="s">mountPath</span><span class="pi">:</span> <span class="s">/usr/share/nginx/html</span>
+           <span class="s">name</span><span class="pi">:</span> <span class="s">metadata-storage</span>
+       <span class="s">volumes</span><span class="pi">:</span>
+       <span class="pi">-</span> <span class="s">name</span><span class="pi">:</span> <span class="s">metadata-storage</span>
+         <span class="s">persistentVolumeClaim</span><span class="pi">:</span>
+           <span class="s">claimName</span><span class="pi">:</span> <span class="s">metadata-storage</span>
+</code></pre>
+    </div>
+
+    <p>等到pod启动成功，到pod调度的机器上面可以看到对应的rbd已经格式化并挂载好了。</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> mount | grep pvc-01b09435-7b49-11e7-8938-1866da9e3d4b
+ /dev/rbd2 on /var/lib/kubelet/pods/41104258-88df-11e7-a533-1866daa4fa2f/volumes/kubernetes.io~rbd/pvc-01b09435-7b49-11e7-8938-1866da9e3d4b <span class="nb">type </span>ext4 <span class="o">(</span>rw,relatime,stripe<span class="o">=</span>1024,data<span class="o">=</span>ordered<span class="o">)</span>
+</code></pre>
+    </div>
+
+    <p>如果应用采用statefulset的方式部署，则可以不用先创建pvc，直接在statefulset的模版里面指定volumeClaimTemplates:</p>
+
+    <div class="language-yaml highlighter-rouge"><pre class="highlight"><code> <span class="s">volumeClaimTemplates</span><span class="pi">:</span>
+ <span class="pi">-</span> <span class="s">metadata</span><span class="pi">:</span>
+     <span class="s">name</span><span class="pi">:</span> <span class="s">prometheus-k8s-db</span>
+ <span class="s">spec</span><span class="pi">:</span>
+   <span class="s">accessModes</span><span class="pi">:</span>
+   <span class="pi">-</span> <span class="s">ReadWriteOnce</span>
+   <span class="s">resources</span><span class="pi">:</span>
+     <span class="s">requests</span><span class="pi">:</span>
+       <span class="s">storage</span><span class="pi">:</span> <span class="s">1Ti</span>
+</code></pre>
+    </div>
+  </li>
+</ol>
+
+<p>至此ceph部署和在kubernetes 中的应用就介绍完了。</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（2. Ceph） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

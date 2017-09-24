@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（7. ingress）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-07-ingress.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（7. ingress）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<blockquote>
+  <p>An <a href="https://kubernetes.io/docs/concepts/services-networking/ingress/#what-is-ingress">Ingress</a> is a collection of rules that allow inbound connections to reach the cluster services.</p>
+</blockquote>
+
+<p>Ingress的引入主要解决创建入口站点规则的问题，主要作用于7层入口(http)。
+可以通过K8s的Ingress对象定义类似于nginx中的vhost、localtion、upstream等。
+Nginx官方也有Ingress的实现<a href="https://github.com/nginxinc/kubernetes-ingress/releases">nginxinc/kubernetes-ingress</a>来对接k8s。</p>
+
+<blockquote>
+  <p><a href="https://github.com/containous/traefik">traefik</a> Træfik (pronounced like traffic) is a modern HTTP reverse proxy and load balancer made to deploy microservices with ease. It supports several backends (Docker, Swarm mode, Kubernetes, Marathon, Consul, Etcd, Rancher, Amazon ECS, and a lot more) to manage its configuration automatically and dynamically.</p>
+</blockquote>
+
+<p>考虑到Traefik部署较为方便，使用traefik提供Ingress服务。</p>
+
+<h4 id="部署步骤">部署步骤</h4>
+
+<ol>
+  <li>
+    <p>定义traefik需要的RBAC规则</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  	  name: traefik-ingress-controller
+  	  namespace: kube-system
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: traefik-ingress-controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - services
+      - endpoints
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: traefik-ingress-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traefik-ingress-controller
+subjects:
+- kind: ServiceAccount
+  name: traefik-ingress-controller
+  namespace: kube-system
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>定义ingress编排的daemonset模版</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: extensions/v1beta1
+ kind: DaemonSet
+ metadata:
+   labels:
+     k8s-app: traefik-ingress-lb
+   name: traefik-ingress-controller
+   namespace: kube-system
+ spec:
+   selector:
+     matchLabels:
+       k8s-app: traefik-ingress-lb
+   template:
+     metadata:
+       labels:
+         k8s-app: traefik-ingress-lb
+         name: traefik-ingress-lb
+     spec:
+       containers:
+       - args:
+         - --web
+         - --web.address=:8580
+         - --kubernetes
+         - --web.metrics
+         - --web.metrics.prometheus
+         image: traefik
+         imagePullPolicy: IfNotPresent
+         name: traefik-ingress-lb
+         ports:
+         - containerPort: 80
+           hostPort: 80
+           protocol: TCP
+         - containerPort: 8580
+           hostPort: 8580
+           protocol: TCP
+         resources:
+           requests:
+             cpu: "2"
+             memory: 4G
+       dnsPolicy: ClusterFirst
+       hostNetwork: true
+       nodeSelector:
+         role: ingress
+       restartPolicy: Always
+       schedulerName: default-scheduler
+       serviceAccount: traefik-ingress-controller
+       serviceAccountName: traefik-ingress-controller
+       terminationGracePeriodSeconds: 60
+</code></pre>
+    </div>
+
+    <p>采用Host Network的方式，部署traekfik<br />
+ 通过<code class="highlighter-rouge">kubectl label node &lt;NODE&gt; role=ingress</code> 为节点打上相应的标签。</p>
+  </li>
+  <li>
+    <p>创建ingress规则</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code>apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: metadata
+  namespace: default
+spec:
+  rules:
+  - host: metadata.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: metadata-server
+          servicePort: 80
+</code></pre>
+    </div>
+
+    <p>这样其实相当于定义了一个http的站点，域名metadata.example.com 指向了default的metadata-server这个服务。</p>
+
+    <p>访问相关节点的8580端口就能看到metadata.example.com站点对应的信息了。</p>
+  </li>
+</ol>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（7. ingress） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

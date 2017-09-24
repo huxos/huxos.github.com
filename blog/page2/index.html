@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>Huxos Blog</title>
+    
+    <meta name="description" content="Huxos Blog">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/blog/page2/" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <ul class="posts-archive">
+  
+    <li>
+    <a href="/hardware/2015/07/19/dell-dtk-tool.html"><h3>使用Dell DTK批量设置服务器BIOS</h3></a>
+      <span class="posts-archive__date">19 Jul 2015</span>
+      下载DELL DTK DTK全称为Dell OpenManage Deployment Toolkit可以用来更改dell服务器的bios等配置 下载地址 下载得到一个集成了DTK的centos的系统,可通过pxe启动,用于在未安装操作系统的服务器上面更改BIOS DTK也有各发行版的软件包,可以在已有操作系统的服务器上面安装.DEBIAN下载地址为: http://linux.dell.com/repo/community/debian/pool/wheezy/ 设置pxe启动dtk工具 解压之后得到SA.1 SA.2 放入到tftp目录的dtk下,编辑pxe启动菜单 label dtk_bios_set kernel dtk/SA.1 append initrd=dtk/SA.2 ramdisk_size=65536 启动之后得到shell,可以执行管理命令. 引导并且自动执行命令...
+    </li>
+  
+    <li>
+    <a href="/linux/2015/05/23/linux-nic-tuning.html"><h3>使用irq绑定＋rps 提升机器网络性能</h3></a>
+      <span class="posts-archive__date">23 May 2015</span>
+      网卡软中断绑定irq设置 使用lspci -vvv 查看网卡时候支持多个收发队列，关键字为MSI-X，并且有Enable+。 ............... Capabilities: [58] MSI: Enable- Count=1/16 Maskable- 64bit+ Address: 0000000000000000 Data: 0000 Capabilities: [a0] MSI-X: Enable+ Count=9 Masked- Vector...
+    </li>
+  
+    <li>
+    <a href="/lvs/2014/05/25/lvs-dr-note.html"><h3>LVS部署DR模式方法备忘</h3></a>
+      <span class="posts-archive__date">25 May 2014</span>
+      1. VS机器设置 安装相应的软件 yum install keepalived ipvsadm 关闭网卡的LRO,GRO 2.1 编辑/etc/rc.local加入, 并且执行操作下面两行命令 ethtool -K eth2 lro off ethtool -K eth2 gro off 修改vs模块hash表长度 编辑/etc/modprobe.d/ip_vs.conf...
+    </li>
+  
+    <li>
+    <a href="/debian/2014/04/28/debian-autoinstall.html"><h3>preseed自动化部署debian</h3></a>
+      <span class="posts-archive__date">28 Apr 2014</span>
+      使用dnsmasq搭建网络启动服务器 安装dnsmasq 编辑配置文件/etc/dnsmasq.conf interface=vboxnet0 #绑定的网卡 domain=jumeicd dhcp-range=192.168.100.3,192.168.100.253,255.255.255.0,1h #dhcp 服务器设置 dhcp-option=3,192.168.100.1 #默认网关 dhcp-option=6,192.168.100.1 #客服端 获取到的dns服务器地址 dhcp-boot=pxelinux.0,pxeserver,192.168.100.2 pxe-service=x86PC, "Install Linux", pxelinux enable-tftp #开启tftp tftp-root=/srv/tftp #tftp目录...
+    </li>
+  
+</ul>
+<!-- 分页链接 -->
+<div class="pagination">
+  
+    
+    <a href="/blog/" class="previous">Previous</a>
+    
+  
+  <span class="page_number">Page: 2 of 2</span>
+  
+    <span class="next">Next</span>
+  
+</div>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

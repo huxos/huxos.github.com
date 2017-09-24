@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（3. Kube master）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（3. Kube master）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<p>本例中部署了kubernetes部署了Master三个节点，可以使用部署Keepalived做Apiserver的高可用。<br />
+其中kubelet是采用systemd启动在物理机上面的，其他组件通过kubernetes的manifests启动在容器里面。<br />
+三个Kubernetes Master的IP地址为：10.22.108.20、10.22.108.79、10.22.108.92，假定使用10.22.108.250作为Apiserver的VIP。</p>
+
+<h4 id="k8s集群配置">k8s集群配置</h4>
+
+<ul>
+  <li>kube-apiserver: 10.22.108.20,10.22.108.79,10.22.108.92, VIP: 10.22.108.250</li>
+  <li>service-cidr: 10.99.66.0/23</li>
+  <li>cluster-domain: cluster.local</li>
+  <li>cluster-cidr: 10.20.0.0/16</li>
+  <li>apiserver-service-ip: 10.99.66.1</li>
+  <li>kubedns-service-ip: 10.99.66.2</li>
+</ul>
+
+<h4 id="部署过程">部署过程</h4>
+
+<ol>
+  <li>
+    <p>生成证书</p>
+
+    <p>采用CloudFlare的PKI工具集 <a href="https://github.com/cloudflare/cfssl">cfssl</a>来制作证书。</p>
+
+    <ol>
+      <li>
+        <p>安装cfssl</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> export GOPATH=${GOPATH:-$HOME/go}
+ go get -u github.com/cloudflare/cfssl/cmd/...
+ export PATH=$GOPATH/bin:$PATH
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>生成ca</p>
+
+        <p>编辑ca-config.json：</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"signing"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"default"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"expiry"</span><span class="p">:</span><span class="w"> </span><span class="s2">"87600h"</span><span class="w">
+         </span><span class="p">},</span><span class="w">
+         </span><span class="nt">"profiles"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"server"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+                 </span><span class="nt">"expiry"</span><span class="p">:</span><span class="w"> </span><span class="s2">"87600h"</span><span class="p">,</span><span class="w">
+                 </span><span class="nt">"usages"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+                     </span><span class="s2">"signing"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"key encipherment"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"server auth"</span><span class="w">
+                 </span><span class="p">]</span><span class="w">
+             </span><span class="p">},</span><span class="w">
+             </span><span class="nt">"client"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+                 </span><span class="nt">"expiry"</span><span class="p">:</span><span class="w"> </span><span class="s2">"87600h"</span><span class="p">,</span><span class="w">
+                 </span><span class="nt">"usages"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+                     </span><span class="s2">"signing"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"key encipherment"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"client auth"</span><span class="w">
+                 </span><span class="p">]</span><span class="w">
+             </span><span class="p">},</span><span class="w">
+             </span><span class="nt">"peer"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+                 </span><span class="nt">"expiry"</span><span class="p">:</span><span class="w"> </span><span class="s2">"87600h"</span><span class="p">,</span><span class="w">
+                 </span><span class="nt">"usages"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+                     </span><span class="s2">"signing"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"key encipherment"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"server auth"</span><span class="p">,</span><span class="w">
+                     </span><span class="s2">"client auth"</span><span class="w">
+                 </span><span class="p">]</span><span class="w">
+             </span><span class="p">}</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">}</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+        </div>
+
+        <p>ca-csr.json</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"kubernetes"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"KUBERNETES"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+        </div>
+
+        <p>使用命令<code class="highlighter-rouge">cfssl gencert -initca ca-csr.json | cfssljson -bare ca -</code> 生成ca证书。</p>
+      </li>
+      <li>
+        <p>生成etcd的证书</p>
+
+        <p>生成etcd-server证书，编辑server.json：</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"server"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="s2">"etcd"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"127.0.0.1"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.20"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.79"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.92"</span><span class="w">
+     </span><span class="p">],</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ETCD"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+        </div>
+
+        <p>使用如下命令生成etcd server证书:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server server.json | cfssljson -bare server
+</code></pre>
+        </div>
+
+        <p>为每一个节点生成etcd peer证书，给etc集群内部通讯使用，执行如下脚本生成证书：</p>
+
+        <div class="language-bash highlighter-rouge"><pre class="highlight"><code> <span class="nv">index</span><span class="o">=</span>0
+ <span class="k">for </span>SERVER <span class="k">in</span> <span class="s2">"10.22.108.20"</span> <span class="s2">"10.22.108.79"</span> <span class="s2">"10.22.108.92"</span>
+ <span class="k">do
+ </span>cat <span class="sh">&lt;&lt;EOF | cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=peer - | cfssljson -bare server${index}
+ {
+     "CN": "infra${index}",
+     "hosts": [
+         "etcd",
+         "$SERVER",
+         "127.0.0.1"
+     ],
+     "key": {
+         "algo": "rsa",
+         "size": 2048
+     },
+     "names": [
+         {
+             "O": "ETCD"
+         }
+     ]
+ }
+ EOF
+</span> <span class="nv">index</span><span class="o">=</span><span class="sb">`</span>expr <span class="nv">$index</span> + 1<span class="sb">`</span>
+ <span class="k">done</span>
+</code></pre>
+        </div>
+
+        <p>生成etcd client证书，编辑client.json：</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"client"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="s2">""</span><span class="w">
+     </span><span class="p">],</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ETCD"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+        </div>
+
+        <p>使用如下命令生成etcd client证书，kube-apiserver访问etcd时使用。</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client client.json | cfssljson -bare client
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>生成kuberbetes相关的证书</p>
+
+        <ol>
+          <li>
+            <p>生成api-server的证书</p>
+
+            <p>编辑kube-apiserver.json:</p>
+
+            <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"kube-apiserver"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="s2">"kubernetes"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"kubernetes.default"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"kubernetes.default.svc"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"kubernetes.default.svc.cluster.local"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"127.0.0.1"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.101.66.1"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.20"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.79"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.92"</span><span class="p">,</span><span class="w">
+         </span><span class="s2">"10.22.108.250"</span><span class="w">
+     </span><span class="p">],</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"system:kube-apiserver"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+            </div>
+
+            <p>使用下面的命令生成证书：</p>
+
+            <div class="highlighter-rouge"><pre class="highlight"><code> cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server kube-apiserver.json | \
+     cfssljson -bare apiserver
+</code></pre>
+            </div>
+
+            <p>#<code class="highlighter-rouge">NOTE</code> 配置中的<code class="highlighter-rouge">hosts</code>要包含访问apiserver用得到的所有的域名和IP。</p>
+          </li>
+          <li>
+            <p>生成kube-proxy的证书</p>
+
+            <p>编辑kube-proxy.json:</p>
+
+            <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"system:kube-proxy"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+     </span><span class="p">],</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"KUBERNETES"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+            </div>
+
+            <p>执行命令：</p>
+
+            <div class="highlighter-rouge"><pre class="highlight"><code> cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client kube-proxy.json | cfssljson -bare proxy
+</code></pre>
+            </div>
+          </li>
+          <li>
+            <p>生成kube-master证书</p>
+
+            <p>编辑kube-master.json:</p>
+
+            <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"kube-master"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="s2">""</span><span class="w">
+     </span><span class="p">],</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"system:masters"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+            </div>
+
+            <p>执行命令:</p>
+
+            <div class="highlighter-rouge"><pre class="highlight"><code> cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client kube-master.json | cfssljson -bare master
+</code></pre>
+            </div>
+
+            <p>该证书用来管理集群使用，具有超级管理员的权限。关于kubernetes的API的授权相关内容参考：<a href="https://kubernetes.io/docs/admin/authorization/rbac/">Using RBAC Authorization</a>。</p>
+          </li>
+        </ol>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>部署kubelet</p>
+
+    <ol>
+      <li>
+        <p>下载kubelet的binary到/opt/bin/</p>
+
+        <div class="language-bash highlighter-rouge"><pre class="highlight"><code> wegt https://storage.googleapis.com/kubernetes-release/release/v1.7.3/bin/linux/amd64/kubelet -O /opt/bin/kubelet <span class="o">&amp;&amp;</span> <span class="se">\ </span>
+ chmod +x /opt/bin/kubelet
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>编辑systemd配置文件</p>
+
+        <p>vim <code class="highlighter-rouge">/lib/systemd/system/kubelet.service</code>：</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> [Unit]
+ After=docker.service
+ Requires=docker.service
+ [Service]
+ ExecStartPre=/bin/mkdir -p /etc/kubernetes/manifests
+ ExecStart=/opt/bin/kubelet \
+ --require-kubeconfig=true \
+ --serialize-image-pulls=false \
+ --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+ --network-plugin=cni \
+ --allow-privileged=true \
+ --container-runtime=docker \
+ --docker=unix:///var/run/docker.sock \
+ --pod-manifest-path=/etc/kubernetes/manifests \
+ --hostname-override=10.22.108.20 \ #NOTE此处需要修改成所在机器IP
+ --cluster-dns=10.99.66.2 \
+ --cluster-domain=cluster.local \
+ --max-pods=32 \
+ --pod-infra-container-image=gcr.io/google_containers/pause-amd64:3.0
+ Restart=always
+ RestartSec=10
+ [Install]
+ WantedBy=multi-user.target
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>编辑kubelet访问apiserver的kubeconfig文件<code class="highlighter-rouge">/etc/kubernetes/worker-kubeconfig.yaml</code> ：</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: v1
+ clusters:
+ - cluster:
+     server: http://127.0.0.1:8080
+   name: default
+ contexts:
+ - context:
+     cluster: default
+     user: ""
+   name: default
+ current-context: default
+ kind: Config
+ preferences: {}
+ users: []
+</code></pre>
+        </div>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>部署etcd</p>
+
+    <p>etcd采用kubernetes的static pod的方式部署在k8s的master节点上。</p>
+
+    <ol>
+      <li>
+        <p>将上面生成的etcd相关的证书包括<code class="highlighter-rouge">server.pem</code>、<code class="highlighter-rouge">server-key.pem</code>、<code class="highlighter-rouge">ca.pem</code> 拷贝到<code class="highlighter-rouge">/etc/etcd/ssl</code>目录下，<br />
+ 将<code class="highlighter-rouge">server{0..2}.pem</code>、<code class="highlighter-rouge">server{0..2}-key.pem</code>分别拷贝到对应三个机器的<code class="highlighter-rouge">/etc/etcd/ssl</code> 目录中，<br />
+ 改名成<code class="highlighter-rouge">memeber.pem</code>、<code class="highlighter-rouge">memeber-key.pem</code>。</p>
+      </li>
+      <li>
+        <p>编辑<code class="highlighter-rouge">/etc/kubernetes/manifests/etcd.yaml</code></p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: v1
+ kind: Pod
+ metadata:
+   name: etcd
+   namespace: kube-system
+   labels:
+     k8s-app: etcd
+ spec:
+   hostNetwork: true
+   containers:
+   - name: etcd
+     image: quay.io/coreos/etcd:v3.2.3
+     command:
+     - etcd
+     - --name=infra0
+     - --data-dir=/var/etcd/data
+     - --cert-file=/etc/etcd/ssl/server.pem
+     - --key-file=/etc/etcd/ssl/server-key.pem
+     - --trusted-ca-file=/etc/etcd/ssl/ca.pem
+     - --peer-cert-file=/etc/etcd/ssl/member.pem
+     - --peer-key-file=/etc/etcd/ssl/member-key.pem
+     - --peer-trusted-ca-file=/etc/etcd/ssl/ca.pem
+     - --client-cert-auth
+     - --peer-client-cert-auth
+     - --initial-advertise-peer-urls=https://10.22.108.20:2380
+     - --listen-peer-urls=https://10.22.108.20:2380
+     - --listen-client-urls=https://10.22.108.20:2379,https://127.0.0.1:2379
+     - --advertise-client-urls=https://10.22.108.20:2379
+     - --initial-cluster-token=6522f860-7ffb-495c-83ee-a0a4ebc39f90
+     - --initial-cluster=infra0=https://10.22.108.20:2380,infra1=https://10.22.108.79:2380,infra2=https://10.22.108.92:2380
+     - --initial-cluster-state=new
+     volumeMounts:
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+     - mountPath: /var/etcd/data
+       name: etcd-data
+     - mountPath: /etc/etcd/ssl
+       name: ssl-certs-etcd
+   volumes:
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+   - hostPath:
+       path: /var/etcd/data
+     name: etcd-data
+   - hostPath:
+       path: /etc/etcd/ssl
+     name: ssl-certs-etcd
+</code></pre>
+        </div>
+
+        <p>需要注意的是：<code class="highlighter-rouge">--name=infra0</code>此处三个机器分别是infra0、infra1、infra2，需要上面各处出现的地址改成相应机器的IP，<br />
+ <code class="highlighter-rouge">--initial-cluster-token</code> 此处使用<code class="highlighter-rouge">uuidgen</code>生成且各个机器保持一致，<br />
+ <code class="highlighter-rouge">--initial-cluster=infra0=https://10.22.108.20:2380,infra1=https://10.22.108.79:2380,infra2=https://10.22.108.92:2380</code>此处各个机器的name和url保持对应。</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>部署kube-apiserver</p>
+
+    <ol>
+      <li>
+        <p>将上面生成的<code class="highlighter-rouge">apiserver.pem</code>、<code class="highlighter-rouge">apiserver-key.pem</code>、<code class="highlighter-rouge">ca.pem</code>、<code class="highlighter-rouge">ca-key.pem</code>拷贝到<code class="highlighter-rouge">/etc/kubernetes/ssl</code>文件夹中。 <br />
+ 将<code class="highlighter-rouge">client.pem</code>、<code class="highlighter-rouge">client-key.pem</code> 拷贝到<code class="highlighter-rouge">/etc/etcd/ssl</code>文件夹中。</p>
+      </li>
+      <li>
+        <p>创建kube-apiserver使用的客户端token文件</p>
+
+        <p>kubelet首次启动时向kube-apiserver发送TLS Bootstrapping请求，kube-apiserver 验证kubelet请求中的token是否与它配置的token.csv一致，<br />
+ 如果一致则自动为 kubelet生成证书和秘钥。</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> # head -c 16 /dev/urandom | od -An -t x | tr -d ' '
+ 7ebc01f3b35182b41acaeecf12857088
+
+ # echo -n 7ebc01f3b35182b41acaeecf12857088,kubelet-bootstrap,10001,system:kubelet-bootstrap  &gt; /etc/kubernetes/token.csv
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>创建api-server启动的static pod，编辑<code class="highlighter-rouge">/etc/kubernetes/manifests/kube-apiserver.yaml</code>:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-apiserver
+   namespace: kube-system
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-apiserver
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - apiserver
+     - --apiserver-count=3
+     - --bind-address=0.0.0.0
+     - --etcd-cafile=/etc/etcd/ssl/ca.pem
+     - --etcd-certfile=/etc/etcd/ssl/client.pem
+     - --etcd-keyfile=/etc/etcd/ssl/client-key.pem
+     - --etcd-servers=https://10.22.108.20:2379,https://10.22.108.79:2379,https://10.22.108.92:2379
+     - --allow-privileged=true
+     - --service-cluster-ip-range=10.99.66.0/23
+     - --secure-port=6443
+     - --advertise-address=10.22.108.20
+     - --admission-control=NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota
+     - --tls-cert-file=/etc/kubernetes/ssl/apiserver.pem
+     - --tls-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+     - --client-ca-file=/etc/kubernetes/ssl/ca.pem
+     - --service-account-key-file=/etc/kubernetes/ssl/ca-key.pem
+     - --authorization-mode=RBAC
+     - --experimental-bootstrap-token-auth
+     - --token-auth-file=/etc/kubernetes/token.csv
+     - --enable-swagger-ui=true
+     volumeMounts:
+     - mountPath: /etc/kubernetes/ssl
+       name: ssl-certs-kubernetes
+       readOnly: true
+     - mountPath: /etc/etcd/ssl
+       name: ssl-certs-etcd
+       readOnly: true
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+     - mountPath: /etc/kubernetes/token.csv
+       name: kubernetes-token
+   volumes:
+   - hostPath:
+       path: /etc/kubernetes/ssl
+     name: ssl-certs-kubernetes
+   - hostPath:
+       path: /etc/etcd/ssl
+     name: ssl-certs-etcd
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+   - hostPath:
+       path: /etc/kubernetes/token.csv
+     name: kubernetes-token
+</code></pre>
+        </div>
+
+        <p>需要注意的是<code class="highlighter-rouge">--advertise-address=10.22.108.20</code> 此处需要改成对应机器的IP，<code class="highlighter-rouge">--authorization-mode=RBAC</code> 启用RBAC。</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>部署kube-controller-manager</p>
+
+    <p>编辑<code class="highlighter-rouge">/etc/kubernetes/manifests/kube-controll-manager.yaml</code>:</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-controller-manager
+   namespace: kube-system
+   labels:
+     k8s-app: kube-controller-manager
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-controller-manager
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - controller-manager
+     - --master=http://127.0.0.1:8080
+     - --leader-elect=true
+     - --cluster-name=kubernetes
+     - --cluster-signing-cert-file=/etc/kubernetes/ssl/ca.pem
+     - --cluster-signing-key-file=/etc/kubernetes/ssl/ca-key.pem
+     - --service-account-private-key-file=/etc/kubernetes/ssl/ca-key.pem
+     - --root-ca-file=/etc/kubernetes/ssl/ca.pem
+     - --allocate-node-cidrs=true
+     - --cluster-cidr=10.20.0.0/16
+     - --node-cidr-mask-size=27
+     livenessProbe:
+       httpGet:
+         host: 127.0.0.1
+         path: /healthz
+         port: 10252
+       initialDelaySeconds: 15
+       timeoutSeconds: 1
+     volumeMounts:
+     - mountPath: /etc/kubernetes/ssl
+       name: ssl-certs-kubernetes
+       readOnly: true
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+     - mountPath: /dev/
+       name: dev
+     - mountPath: /etc/ceph/
+       name: cephconfig
+   volumes:
+   - hostPath:
+       path: /etc/kubernetes/ssl
+     name: ssl-certs-kubernetes
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+   - hostPath:
+       path: /etc/ceph
+     name: cephconfig
+   - hostPath:
+       path: /dev/
+     name: dev
+</code></pre>
+    </div>
+
+    <p>此处<code class="highlighter-rouge">--allocate-node-cidrs=true、--cluster-cidr=10.20.0.0/16</code> 将为每一个机器生成一个子网段，可以用来做IPAM。</p>
+  </li>
+  <li>
+    <p>部署kube-scheduler</p>
+
+    <p>编辑kube-scheduler的static pod的配置文件<code class="highlighter-rouge">/etc/kubernetes/kube-scheduler.yaml</code></p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-scheduler
+   namespace: kube-system
+   labels:
+     k8s-app: kube-scheduler
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-scheduler
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - scheduler
+     - --master=http://127.0.0.1:8080
+     - --leader-elect=true
+     livenessProbe:
+       httpGet:
+         host: 127.0.0.1
+         path: /healthz
+         port: 10251
+       initialDelaySeconds: 15
+       timeoutSeconds: 1
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>部署kube-proxy</p>
+
+    <p>编辑<code class="highlighter-rouge">/etc/kubernetes/kube-proxy.yaml</code>:</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> apiVersion: v1
+ kind: Pod
+ metadata:
+   name: kube-proxy
+   namespace: kube-system
+ spec:
+   hostNetwork: true
+   containers:
+   - name: kube-proxy
+     image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+     command:
+     - /hyperkube
+     - proxy
+     - --master=http://127.0.0.1:8080
+     - --hostname-override=10.22.108.20
+     - --cluster-cidr=10.99.66.0/23
+     securityContext:
+       privileged: true
+     volumeMounts:
+     - mountPath: /etc/ssl/certs
+       name: ssl-certs-host
+       readOnly: true
+   volumes:
+   - hostPath:
+       path: /usr/share/ca-certificates
+     name: ssl-certs-host
+</code></pre>
+    </div>
+
+    <p>需要把<code class="highlighter-rouge">--hostname-override=10.22.108.20</code> 改成对应的IP地址</p>
+  </li>
+  <li>
+    <p>部署网络组建Flanneld</p>
+
+    <p>flanneld可以<a href="https://github.com/coreos/flannel/tree/master/Documentation">通过kubernetes的daemonset部署在容器里面</a>。
+ 为了避免因docker daemon重启带来的风险，我们把他部署在宿主机上，采用systemd unit启动。</p>
+
+    <ol>
+      <li>
+        <p>生成flanneld访问etcd的证书。</p>
+
+        <p>编辑flannel.json:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"flannel"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="s2">""</span><span class="w">
+     </span><span class="p">],</span><span class="w">
+     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+         </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+     </span><span class="p">},</span><span class="w">
+     </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+         </span><span class="p">{</span><span class="w">
+             </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ETCD"</span><span class="w">
+         </span><span class="p">}</span><span class="w">
+     </span><span class="p">]</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+
+</span></code></pre>
+        </div>
+
+        <p>执行命令：</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=client flannel.json | cfssljson -bare flannel
+</code></pre>
+        </div>
+
+        <p>将生成的证书<code class="highlighter-rouge">flannel.pem</code>、<code class="highlighter-rouge">flannel-key.pem</code>、<code class="highlighter-rouge">ca.pem</code> 放到<code class="highlighter-rouge">/etc/flannel/ssl</code>下面。</p>
+      </li>
+      <li>
+        <p>编辑flanneld的systemd unit,<code class="highlighter-rouge">/lib/systemd/system/flanneld.service</code>:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> [Service]
+ ExecStart=/opt/bin/flanneld \
+    -iface enp4s0f0 \
+    -etcd-cafile=/etc/flannel/ssl/ca.pem \
+    -etcd-certfile=/etc/flannel/ssl/flannel.pem \
+    -etcd-keyfile=/etc/flannel/ssl/flannel-key.pem \
+    -etcd-endpoints="https://10.22.108.20:2379,https://10.22.108.79:2379,https://10.22.108.92:2379" \
+    -etcd-prefix="/coreos.com/network" \
+    -ip-masq
+ Restart=always
+ RestartSec=10
+ [Install]
+ WantedBy=multi-user.target
+</code></pre>
+        </div>
+
+        <p>需要把<code class="highlighter-rouge">-iface enp4s0f0</code> 改成对应的网卡名字，使用<code class="highlighter-rouge">systemctl start flanneld</code>启动flanneld。</p>
+      </li>
+      <li>
+        <p>在etcd中加入flanneld的配置项</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> etcdctl \
+   --endpoints=https://10.22.108.20:2379/ \
+   --ca-file=/etc/flannel/ssl/ca.pem  \
+   --cert-file=/etc/flannel/ssl/flannel.pem  \
+   --key-file=/etc/flannel/ssl/flannel-key.pem  \
+   set /coreos.com/network/config \
+   '{"Network":"10.100.0.0/16", "SubnetLen": 27, "Backend": {"Type": "vxlan"}}'
+</code></pre>
+        </div>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>部署CNI</p>
+
+    <ol>
+      <li>
+        <p>下载CNI</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> mkdir -p /opt/cni/bin/
+ wget https://github.com/containernetworking/cni/releases/download/v0.6.0/cni-amd64-v0.6.0.tgz -O - |tar -zxpvf - -C /opt/cni/bin/
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>编辑CNI配置</p>
+
+        <p>编辑<code class="highlighter-rouge">/etc/cni/net.d/10-containers.conf</code>:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code><span class="w"> </span><span class="p">{</span><span class="w">
+     </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"cbr0"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"flannel"</span><span class="p">,</span><span class="w">
+     </span><span class="nt">"delegate"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+         </span><span class="nt">"isDefaultGateway"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w">
+     </span><span class="p">}</span><span class="w">
+ </span><span class="p">}</span><span class="w">
+</span></code></pre>
+        </div>
+      </li>
+    </ol>
+  </li>
+</ol>
+
+<p>至此master节点就配置完成了。使用<code class="highlighter-rouge">systemctl enable kubelet flanneld</code> 确保服务开机自启。
+如果遇到无法获取gcr.io的镜像，可以绑定hosts <code class="highlighter-rouge">216.58.220.192 gcr.io</code>。</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（3. Kube master） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

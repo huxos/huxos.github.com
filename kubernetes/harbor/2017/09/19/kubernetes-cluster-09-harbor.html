@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（9. harbor）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/harbor/2017/09/19/kubernetes-cluster-09-harbor.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（9. harbor）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<h3 id="kubernetes集群搭建9-镜像仓库harbor">kubernetes集群搭建（9. 镜像仓库harbor）</h3>
+
+<p><a href="https://github.com/vmware/harbor">Harbor</a>是VMware开发的企业级docker镜像仓库，官方提供了基于docker-compose的方式部署。<br />
+花了好些时间将其conpose的编排模版转换成k8s的调度模版方便部署到k8s集群中，项目地址为: <a href="https://github.com/huxos/harbor-kubernetes">https://github.com/huxos/harbor-kubernetes</a>。</p>
+
+<p>部署架构：</p>
+
+<ul>
+  <li>把harbor的mysql组件部署到单独的一个Pod中，采用ceph的rbd作为数据库的存储。</li>
+  <li>新增redis做session共享。</li>
+  <li>采用ceph的rgw作为镜像的后端存储。</li>
+  <li>其余组件（包括adminserver、jobservice、ui、nginx、registry）部署到同一个Pod中，使用127.0.0.1通讯。</li>
+</ul>
+
+<p>这样部署可以通过k8s使得harbor灵活的缩放。</p>
+
+<h4 id="部署步骤">部署步骤</h4>
+
+<ol>
+  <li>
+    <p>部署ceph-rgw并添加访问ceph的用户</p>
+
+    <p>由于我们使用ceph的rgw作为registry的后端，首先参照之前部署ceph的步骤<a href="http://huxos.me/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html">kubernetes集群搭建（2. Ceph）</a>
+在kube-system-2 kube-system-4上面部署<code class="highlighter-rouge">ceph-rgw</code></p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code>ceph-deploy rgw create kube-system-2 kube-system-4
+</code></pre>
+    </div>
+
+    <p>添加访问rgw的账户：</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code>##创建用户
+radosgw-admin user create --uid=registry --display-name="ceph rgw docker registry user"
+
+#registry支持ceph的swift协议，创建swift子账号
+radosgw-admin subuser create --uid registry --subuser=registry:swift --access=full --secret=secretkey --key-type=swift
+
+#创建secret key
+radosgw-admin key create --subuser=registry:swift --key-type=swift --gen-secret
+
+{
+    "user_id": "registry",
+    "display_name": "ceph rgw docker registry user",
+    "email": "",
+    "suspended": 0,
+    "max_buckets": 1000,
+    "auid": 0,
+    "subusers": [
+        {
+            "id": "registry:swift",
+            "permissions": "full-control"
+        }
+    ],
+    "keys": [
+        {
+            "user": "registry",
+            "access_key": "********************",
+            "secret_key": "****************************************"
+        }
+    ],
+    "swift_keys": [
+        {
+            "user": "registry:swift",
+            "secret_key": "e***************************************"
+        }
+    ],
+    "caps": [],
+    "op_mask": "read, write, delete",
+    "default_placement": "",
+    "placement_tags": [],
+    "bucket_quota": {
+        "enabled": false,
+        "max_size_kb": -1,
+        "max_objects": -1
+    },
+    "user_quota": {
+        "enabled": false,
+        "max_size_kb": -1,
+        "max_objects": -1
+    },
+    "temp_url_keys": []
+}
+</code></pre>
+    </div>
+    <p>记录好上面的swift_keys里面的secret_key: <code class="highlighter-rouge">e*************************************** </code></p>
+  </li>
+  <li>
+    <p>生成registry 使用的证书</p>
+
+    <p>参照前篇<a href="http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html">kubernetes集群搭建（3. Kube master）</a>生成证书，供给harbor使用。</p>
+
+    <p>编辑harbor.json</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code><span class="p">{</span><span class="w">
+    </span><span class="nt">"CN"</span><span class="p">:</span><span class="w"> </span><span class="s2">"harbor"</span><span class="p">,</span><span class="w">
+    </span><span class="nt">"hosts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+        </span><span class="s2">"registry.example.com"</span><span class="p">,</span><span class="w">
+        </span><span class="s2">"quay.io"</span><span class="p">,</span><span class="w">
+        </span><span class="s2">"gcr.io"</span><span class="w">
+    </span><span class="p">],</span><span class="w">
+    </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w">
+        </span><span class="nt">"algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rsa"</span><span class="p">,</span><span class="w">
+        </span><span class="nt">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="w">
+    </span><span class="p">},</span><span class="w">
+    </span><span class="nt">"names"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+        </span><span class="p">{</span><span class="w">
+            </span><span class="nt">"O"</span><span class="p">:</span><span class="w"> </span><span class="s2">"REGISTRY"</span><span class="w">
+        </span><span class="p">}</span><span class="w">
+    </span><span class="p">]</span><span class="w">
+</span><span class="p">}</span><span class="w">
+</span></code></pre>
+    </div>
+
+    <p>使用命令: <code class="highlighter-rouge">cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server harbor.json | cfssljson -bare harbor</code> 生成证书。<br />
+这里的证书需要签名访问harbor使用的域名，根据实际情况替换掉<code class="highlighter-rouge">registry.example.com</code></p>
+
+    <p>创建harbor部署的namespace:</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code>kubectl create ns registry
+</code></pre>
+    </div>
+
+    <p>作为secret导入证书：</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code>kubectl create secret tls harbor --key harbor-key.pem --cert harbor.pem
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>部署harbor组件</p>
+
+    <ol>
+      <li>
+        <p>harbor的部署模版以及提交到git仓库中，首先将其clone下来</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> git clone https://github.com/huxos/harbor-kubernetes.git
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>部署mysql组件</p>
+
+        <p>参照前篇为导入ceph的key到registry中<a href="http://huxos.me/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html">kubernetes集群搭建（2. Ceph）</a></p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> #导入ceph的key到registry的namespace中
+ kubectl create secret generic ceph-secret-kube --type="kubernetes.io/rbd" \
+     --from-literal=key=`ceph --cluster ceph auth get-key client.kube` --namespace=registry
+
+ # mysql使用的rbd
+ kubectl create -f pvc/mysql-data.yaml
+
+ # 导入mysql的环境变量
+ kubectl create -f cm/db-env.yaml
+
+ # 部署mysql
+ kubectl create -f mysql.deploy.yaml
+
+ # svc
+ kubectl create -f svc/mysql.yaml
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>部署redis</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f redis.deploy.yaml
+ kubectl create -f svc/redis.yaml
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>部署harbor</p>
+
+        <p>首先编辑cm下面的configMap文件、将<code class="highlighter-rouge">cm/registry.yaml</code>里面的harbor的访问地址<code class="highlighter-rouge">registry.example.com</code>根据实际情况替换掉，配置的ceph rgw的访问地址和密码。</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> #导入configmap
+ #adminserver
+ kubectl create -f cm/adminserver.yaml -f cm/adminserver-env.yaml
+ #jobservice
+ kubectl create -f cm/jobservice.yaml -f cm/jobservice-env.yaml
+ #registry
+ kubectl create -f cm/registry.yaml
+ #ui
+ kubectl create -f cm/ui-env.yaml -f cm/ui.yaml
+ #nginx
+ kubectl create -f cm/nginx.yaml
+
+ #部署harbor
+ kubectl create -f harbor.deploy.yaml
+</code></pre>
+        </div>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>配置docker</p>
+
+    <p>由于访问reigstry的证书是自签名的需要将ca放到docker的ca目录中</p>
+
+    <p>将ca文件复制到 <code class="highlighter-rouge">/etc/docker/&lt;registry的访问域名&gt;／ca.crt</code></p>
+  </li>
+</ol>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（9. harbor） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

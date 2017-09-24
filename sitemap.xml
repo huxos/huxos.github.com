@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  
+    
+      <url>
+        <loc>http://localhost:4000/bind/2017/09/23/dns-cluster.html</loc>
+        
+        <lastmod>2017-09-23T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/harbor/2017/09/19/kubernetes-cluster-09-harbor.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/prometheus/2017/09/19/kubernetes-cluster-08-prometheus.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-07-ingress.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-06-loadbancer.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-05-kube-addons.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-04-kube-node.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/kubernetes/docker/2017/09/19/kubernetes-cluster-01-docker.html</loc>
+        
+        <lastmod>2017-09-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/hardware/2015/07/19/dell-dtk-tool.html</loc>
+        
+        <lastmod>2015-07-19T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/linux/2015/05/23/linux-nic-tuning.html</loc>
+        
+        <lastmod>2015-05-23T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/lvs/2014/05/25/lvs-dr-note.html</loc>
+        
+        <lastmod>2014-05-25T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/debian/2014/04/28/debian-autoinstall.html</loc>
+        
+        <lastmod>2014-04-28T00:00:00+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.5</priority>
+        
+      </url>
+    
+  
+
+  
+    
+      <url>
+        <loc>http://localhost:4000/categories.html</loc>
+        
+        <lastmod>2017-09-24T11:11:22+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.3</priority>
+        
+      </url>
+    
+  
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/about/</loc>
+        
+        <lastmod>2017-09-24T11:11:22+08:00</lastmod>
+        
+        
+        <changefreq>monthly</changefreq>
+        
+        
+        <priority>0.3</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/blog/</loc>
+        
+        <lastmod>2017-09-24T11:11:22+08:00</lastmod>
+        
+        
+        <changefreq>daily</changefreq>
+        
+        
+        <priority>0.3</priority>
+        
+      </url>
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/</loc>
+        
+        <lastmod>2017-09-24T11:11:22+08:00</lastmod>
+        
+        
+        <changefreq>daily</changefreq>
+        
+        
+        <priority>0.3</priority>
+        
+      </url>
+    
+  
+    
+  
+    
+      <url>
+        <loc>http://localhost:4000/blog/page2/</loc>
+        
+        <lastmod>2017-09-24T11:11:22+08:00</lastmod>
+        
+        
+        <changefreq>daily</changefreq>
+        
+        
+        <priority>0.3</priority>
+        
+      </url>
+    
+  
+</urlset>

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>LVS部署DR模式方法备忘</title>
+    
+    <meta name="description" content="LVS部署DR模式方法">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/lvs/2014/05/25/lvs-dr-note.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">LVS部署DR模式方法备忘</h1>
+<p class="post-meta">25 May 2014</p>
+
+<div class="posts">
+<h3 id="1-vs机器设置">1. VS机器设置</h3>
+
+<ol>
+  <li>
+    <p>安装相应的软件</p>
+
+    <p><code class="highlighter-rouge">yum install keepalived ipvsadm</code></p>
+  </li>
+  <li>
+    <p>关闭网卡的<code class="highlighter-rouge">LRO</code>,<code class="highlighter-rouge">GRO</code></p>
+
+    <p>2.1  编辑<code class="highlighter-rouge">/etc/rc.local</code>加入, 并且执行操作下面两行命令</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> ethtool -K eth2 lro off
+ ethtool -K eth2 gro off
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>修改vs模块hash表长度</p>
+
+    <p>编辑<code class="highlighter-rouge">/etc/modprobe.d/ip_vs.conf</code> 加入:</p>
+
+    <div class="language-shell highlighter-rouge"><pre class="highlight"><code> options ip_vs  <span class="nv">conn_tab_bits</span><span class="o">=</span>20
+</code></pre>
+    </div>
+
+    <p>重新加载ip_vs 模块</p>
+
+    <div class="language-shell highlighter-rouge"><pre class="highlight"><code> modprobe -r ip_vs <span class="o">&amp;&amp;</span> modprobe ip_vs
+</code></pre>
+    </div>
+
+    <p>执行<code class="highlighter-rouge">ipvsadm -Ln</code>确认参数是否生效</p>
+
+    <div class="language-shell highlighter-rouge"><pre class="highlight"><code> IP Virtual Server version 1.2.1 <span class="o">(</span><span class="nv">size</span><span class="o">=</span>1048576<span class="o">)</span> <span class="c">##此处为默认的1024则不生效</span>
+ Prot LocalAddress:Port Scheduler Flags
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>配置keepalived</p>
+
+    <p>编辑<code class="highlighter-rouge">/etc/keepalived/keepalived.conf</code> 使用<code class="highlighter-rouge">man keepalived.conf</code> 查看配置示例. 下面是配置模板:</p>
+
+    <p>需要要注意的是: router_id 在一个vlan不能重复, realserver要与VS在同一个网段, 前后段端口一致, 根据业务设置不同的持久连接时间</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> global_defs {
+     notification_email {
+         hujun@example.com
+     }
+     notification_email_from noreply-lvs@example.com
+     smtp_server 127.0.0.1
+     smtp_connect_timeout 60
+     router_id lvs_main
+ }
+
+ vrrp_instance VI_0 {
+     state MASTER
+     interface  eth2
+     virtual_router_id 233 ##router_id 同一个vlan不能重复
+     priority 100
+     advert_int 1
+     authentication {
+         auth_type PASS
+         auth_pass lvs@example
+     }
+     virtual_ipaddress {
+         10.33.125.233
+     }
+ }
+
+ virtual_server 10.33.125.233 6083 {
+     delay_loop 6
+     lb_algo rr
+     lb_kind DR   ##dr模式
+     protocol TCP
+     persistence_timeout 0 ##持久连接时间
+     real_server 10.33.124.35 6083 {
+         TCP_CHECK {
+             connect_timeout 10
+         }
+     }
+     real_server 10.33.124.18 6083 {
+         TCP_CHECK {
+             connect_timeout 10
+         }
+     }
+ }
+
+ virtual_server 10.33.125.234 6083 {
+     delay_loop 6
+     lb_algo rr
+     lb_kind DR
+     protocol TCP
+     persistence_timeout 0
+     real_server 10.33.124.35 6083 { ##realserverIP
+         TCP_CHECK {
+             connect_timeout 10
+         }
+     }
+     real_server 10.33.124.18 6083 {
+         TCP_CHECK {
+             connect_timeout 10
+         }
+     }
+ }
+</code></pre>
+    </div>
+  </li>
+</ol>
+
+<h3 id="2-realserver配置">2. RealServer配置</h3>
+
+<ol>
+  <li>
+    <p>添加内核配置</p>
+
+    <p>编辑<code class="highlighter-rouge">/etc/sysctl.conf</code> 加入如下内容, 并执行<code class="highlighter-rouge">sysctl -e -p</code> 抑制非本接口的arp响应, 避免realserver 上的arp广播抢占VIP</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> net.ipv4.conf.lo.arp_ignore<span class="o">=</span>1
+ net.ipv4.conf.lo.arp_announce<span class="o">=</span>2
+ net.ipv4.conf.all.arp_ignore<span class="o">=</span>1
+ net.ipv4.conf.all.arp_announce<span class="o">=</span>2
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>设置VIP</p>
+
+    <p>编辑<code class="highlighter-rouge">/etc/sysconfig/network-scripts/ifcfg-lo:0</code> 加入如下配置, 其中<code class="highlighter-rouge">10.33.125.233</code> 为需要设置的VIP</p>
+
+    <div class="language-bash highlighter-rouge"><pre class="highlight"><code> <span class="nv">DEVICE</span><span class="o">=</span>lo:0
+ <span class="nv">IPADDR</span><span class="o">=</span>10.33.125.233
+ <span class="nv">NETMASK</span><span class="o">=</span>255.255.255.255
+ <span class="nv">NETWORK</span><span class="o">=</span>10.33.125.233
+ <span class="nv">BROADCAST</span><span class="o">=</span>10.33.125.233
+ <span class="nv">ONBOOT</span><span class="o">=</span>yes
+ <span class="nv">NAME</span><span class="o">=</span>lo0
+</code></pre>
+    </div>
+
+    <p>也可以添加多个文件绑定多个VIP,比如<code class="highlighter-rouge">/etc/sysconfig/network-scripts/ifcfg-lo:1</code></p>
+
+    <p>然后执行<code class="highlighter-rouge">ifup lo:0</code>启动相应的网卡.</p>
+  </li>
+  <li>
+    <p>启动服务</p>
+
+    <p>服务建议监听0.0.0.0 , VIP上监听是为了做负载均衡, 实IP上监听是LVS存活检测的需要.</p>
+  </li>
+</ol>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('LVS部署DR模式方法备忘 —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

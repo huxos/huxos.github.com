@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（8. prometheus）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/prometheus/2017/09/19/kubernetes-cluster-08-prometheus.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（8. prometheus）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<blockquote>
+  <p><a href="https://github.com/prometheus/prometheus">Prometheus</a> 的设计非常适合k8s集群的监控。<br />
+大多数k8s的组件都提供prometheus格式的监控接口，只需要配置好kube-api作为promethues的sd就能非常容易的监控整个k8s集群，无需引入额外的依赖。<br />
+prometheus提供了众多语言的库，可以非常容易的嵌入到业务代码中做业务监控。</p>
+</blockquote>
+
+<p>可以采用CoreOS所提供的 <a href="https://github.com/coreos/prometheus-operator">prometheus-operator</a>来部署prometheus，
+但是使用过程中发现其有些较不灵活的地方。比如：只能使用promethues-operator预定义的参数启动prometheus。 <br />
+现将prometheus-operator生成的规则导出来做成configmap，独立部署prometheus，同时加入相关的规则使得其能够自动根据service的annotation进行发现和监控。</p>
+
+<h4 id="部署步骤">部署步骤</h4>
+
+<p>使用statefulset的方式部署prometheus，监控数据存储在ceph的rbd里面。 <br />
+考虑到1.7版本的prometheus在数据轮换的时候产生大量的IO开销，所以部署了prometheus2.0 beta。</p>
+
+<ol>
+  <li>
+    <p>一些准备工作</p>
+
+    <p>首先创建monitoring这个namespaces</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> # kubectl create ns monitoring
+</code></pre>
+    </div>
+
+    <p>参照前面的<a href="http://huxos.me/kubernetes/ceph/2017/09/19/kubernetes-cluster-02-ceph.html">kubernetes集群搭建（2. Ceph）</a>，
+ 在monitoring这个namespace中要使用RBD先要作为secret导入ceph的key。</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create secret generic ceph-secret-kube --type="kubernetes.io/rbd" \
+     --from-literal=key=`ceph --cluster ceph auth get-key client.kube` --namespace=monitoring
+</code></pre>
+    </div>
+
+    <p>由于etcd部署了ssl，prometheus监控etcd需要先导入etcd的证书到k8s中用secret保存</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create secret generic etcd-client-ssl --from-file=ca.pem --from-file=client-key.pem --from-file=client.pem
+</code></pre>
+    </div>
+  </li>
+  <li>
+    <p>部署prometheus</p>
+
+    <p>部署prometheus的编排模版已经将其上传到了github上，首先将其clone下来。</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> git clone https://github.com/huxos/prometheus-kubernetes.git
+</code></pre>
+    </div>
+
+    <p>部署prometheus:</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f prometheus-rbac.yaml
+ kubectl create -f prometheus-k8s-cm.yaml
+ kubectl create -f prometheus-k8s-rules.yaml
+ kubectl create -f prometheus-statefulset.yaml
+ kubectl create -f prometheus-svc.yaml
+</code></pre>
+    </div>
+
+    <p>部署alertmanager（alertmanager主要用来做prometheus的监控告警）：</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f alertmanager-cm.yaml
+ kubectl create -f alertmanager-statefulset.yaml
+ kubectl create -f alertmanager-svc.yaml
+</code></pre>
+    </div>
+
+    <p>部署kube-state-metric（kube-state-metric用来获取k8s集群的关联信息）:</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f kube-state-metric-rbac.yaml
+ kubectl create -f kube-state-metric-deploy.yaml
+ kubectl create -f kube-state-metric-svc.yaml
+</code></pre>
+    </div>
+
+    <p>部署node-exporter（如果需要宿主机的监控，需要部署node-exporter）：</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f node-exporter-ds.yaml
+ kubectl create -f node-exporter-svc.yaml
+</code></pre>
+    </div>
+
+    <p>部署grafana（grafana用来做监控的绘图展示）：</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f grafana-credentails.secret.yaml
+ kubectl create -f grafana-deploy.yaml
+ kubectl create -f grafana-svc.yaml
+</code></pre>
+    </div>
+
+    <p>创建相关enpoints用于kubelet、kube-conrtroller-manger、kube-scheduler、etcd等的监控：</p>
+
+    <div class="highlighter-rouge"><pre class="highlight"><code> kubectl create -f prometheus-discovery-service.yaml
+
+</code></pre>
+    </div>
+
+    <p>最后在grafan的页面（用户名：admin、密码：admin）mport文件夹dashborad里面的模版，就行了。</p>
+  </li>
+</ol>
+
+<h4 id="监控集群内的服务">监控集群内的服务</h4>
+
+<p>以ceph的监控为例，看看prometheus如何监控集群内的service。</p>
+
+<p>首先部署好ceph-exporter、访问9128端口确保能正常获取数据、创建service让prometheus自动发现并采集ceph-exporter的监控信息：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+   labels:
+    k8s-app: ceph-exporter
+    run: ceph-exporter
+  name: ceph-exporter
+  namespace: monitoring
+spec:
+  clusterIP: None
+  ports:
+  - name: metrics
+    port: 9128
+    protocol: TCP
+    targetPort: 9128
+  selector:
+    run: ceph-exporter
+  type: ClusterIP
+</code></pre>
+</div>
+
+<p>在service的 annotations 中加入<code class="highlighter-rouge">prometheus.io/scrape: "true"</code> 就能使prometheus自动发现并监控。
+此外还可以通过<code class="highlighter-rouge">prometheus.io/schema</code>、<code class="highlighter-rouge">prometheus.io/path</code>、<code class="highlighter-rouge">prometheus.io/port</code>等设置自动发现规则。</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（8. prometheus） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

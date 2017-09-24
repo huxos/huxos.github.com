@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>使用Dell DTK批量设置服务器BIOS</title>
+    
+    <meta name="description" content="使用Dell DTK批量设置服务器BIOS">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/hardware/2015/07/19/dell-dtk-tool.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">使用Dell DTK批量设置服务器BIOS</h1>
+<p class="post-meta">19 Jul 2015</p>
+
+<div class="posts">
+<h4 id="下载dell-dtk">下载DELL DTK</h4>
+
+<blockquote>
+  <p>DTK全称为<code class="highlighter-rouge">Dell OpenManage Deployment Toolkit</code>可以用来更改dell服务器的bios等配置</p>
+</blockquote>
+
+<p><a href="http://www.dell.com/support/home/us/en/19/Drivers/DriversDetails?driverId=8PRMX">下载地址</a>
+  下载得到一个集成了DTK的centos的系统,可通过pxe启动,用于在未安装操作系统的服务器上面更改BIOS</p>
+
+<p>DTK也有各发行版的软件包,可以在已有操作系统的服务器上面安装.DEBIAN下载地址为: <a href="http://linux.dell.com/repo/community/debian/pool/wheezy/">http://linux.dell.com/repo/community/debian/pool/wheezy/</a></p>
+
+<h4 id="设置pxe启动dtk工具">设置pxe启动dtk工具</h4>
+
+<p>解压之后得到SA.1 SA.2 放入到tftp目录的dtk下,编辑pxe启动菜单</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>label dtk_bios_set
+    kernel dtk/SA.1
+    append initrd=dtk/SA.2 ramdisk_size=65536
+</code></pre>
+</div>
+
+<p>启动之后得到shell,可以执行管理命令.</p>
+
+<h4 id="引导并且自动执行命令">引导并且自动执行命令</h4>
+
+<p>编辑pxe引导之后自动执行的脚本, 其中<code class="highlighter-rouge">/opt/dell/toolkit/bin/syscfg</code> 就是DTK中用于设置BIOS的工具.</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>  <span class="c">#!/bin/sh -e</span>
+
+  /opt/dell/toolkit/bin/syscfg --virtualization<span class="o">=</span>disable
+  <span class="c">#/opt/dell/toolkit/bin/syscfg --cpucle=enable</span>
+  /opt/dell/toolkit/bin/syscfg --logicproc<span class="o">=</span>disable
+  <span class="c">#/opt/dell/toolkit/bin/syscfg --turbomode=enable</span>
+  <span class="c">#/opt/dell/toolkit/bin/syscfg --cstates=enable</span>
+  /opt/dell/toolkit/bin/syscfg --serialcomm<span class="o">=</span>on
+  <span class="c">#/opt/dell/toolkit/bin/syscfg --conboot=enable</span>
+  <span class="c">#/opt/dell/toolkit/bin/syscfg --memintleave=disable</span>
+  /opt/dell/toolkit/bin/syscfg power --profile<span class="o">=</span>maxperformance --setuppwdoverride <span class="c">#关闭节能模式，性能最大化</span>
+
+  <span class="c"># 可以在此处使用ipmitool等工具来更改IPMI的配置 ...</span>
+
+  <span class="c">## 脚本最后重启服务器</span>
+  reboot
+</code></pre>
+</div>
+<p>保存到pxe启动的dtk目录下面,文件名称为bios.sh</p>
+
+<p>编辑上面提到的pxe引导配置，传递参数脚本路径、脚本名字、tftp服务器IP。(也支持从http获取脚本)</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>label dtk_bios_set
+      kernel dtk/SA.1
+      append initrd=dtk/SA.2 ramdisk_size=65536 share_type=tftp share_location=dtk share_script=bios.sh tftp_ip=&lt;tftp服务器IP地址&gt;
+</code></pre>
+</div>
+
+<p>这样下次引导到DTK之后就会自动修改bios并且重启</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('使用Dell DTK批量设置服务器BIOS —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>基于mysql存储的DNS（bind）部署方案和步骤</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/bind/2017/09/23/dns-cluster.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">基于mysql存储的DNS（bind）部署方案和步骤</h1>
+<p class="post-meta">23 Sep 2017</p>
+
+<div class="posts">
+<h4 id="bind部署的架构">bind部署的架构</h4>
+
+<p><img src="/images/bind-cluster.png" alt="bind架构" /></p>
+
+<p>其中master节点采用dlz的方式与使用mysql作为数据后端，slave节点通过zone transfer与master节点同步。<br />
+Master不作为服务节点，Slave节点使用LVS作为负载均衡提供服务，这样可以很方便的通过对数据库的CURD操作进行dns记录的变更，同时也可以保留bind原生的性能。<br />
+由于master节点的数据保存在mysql中，当数据发生变化之后无法及时感知，slave节点的数据可能会出现与mster不一致的情况。这时我们需要对salve发送notify指令来主动同步master的数据。
+可以使用<a href="https://github.com/huxos/dns-notify">https://github.com/huxos/dns-notify</a> 来发送notify指令。</p>
+
+<h4 id="部署步骤">部署步骤</h4>
+
+<p>PS：部署操作系统为：<code class="highlighter-rouge">Centos 7</code>, Bind版本为<code class="highlighter-rouge">9.11.0-P5</code>。</p>
+
+<p>1．编译bind支持mysql</p>
+
+<p>安装编译依赖</p>
+
+<div class="language-shell highlighter-rouge"><pre class="highlight"><code>yum install openssl-devel mariadb-devel gcc
+ln -sf /usr/lib64/mysql/libmysqlclient.so.18 /lib64/libmysqlclient.so
+</code></pre>
+</div>
+
+<p>编译bind</p>
+
+<div class="language-shell highlighter-rouge"><pre class="highlight"><code><span class="nb">cd</span> /usr/src
+wget http://ftp.isc.org/isc/bind9/9.11.0-P5/bind-9.11.0-P5.tar.gz
+tar -zxf <span class="nb">bind</span>-9.11.0-P5.tar.gz
+<span class="nb">cd bind</span>-9.11.0-P5
+./configure --with-dlz-mysql --enable-largefile --enable-threads<span class="o">=</span>no --prefix<span class="o">=</span>/usr/local/bind
+make
+make install
+</code></pre>
+</div>
+
+<p>创建bind运行的用户</p>
+
+<pre><code class="language-Shell">groupadd -r -g 25 named
+useradd -r -u 25 -s /bin/nologin -d /usr/local/named -g named named
+mkdir -p /var/cache/bind/data
+chown named:named /var/cache/bind
+</code></pre>
+
+<p>2．创建数据库的表结构</p>
+
+<p>连接上mysqi创建数据库表</p>
+
+<pre><code class="language-Sql">CREATE TABLE `dns_records` (
+    `zone` varchar(255) DEFAULT NULL,
+    `host` varchar(255) DEFAULT NULL,
+    `type` varchar(255) DEFAULT NULL,
+    `data` varchar(255) NOT NULL DEFAULT '',
+    `ttl` int(11) DEFAULT NULL,
+    `mx_priority` varchar(255) DEFAULT NULL,
+    `refresh` int(11) DEFAULT NULL,
+    `retry` int(11) DEFAULT NULL,
+    `expire` int(11) DEFAULT NULL,
+    `minimum` int(11) DEFAULT NULL,
+    `serial` bigint(20) DEFAULT NULL,
+    `resp_person` varchar(255) DEFAULT NULL,
+    `primary_ns` varchar(255) DEFAULT NULL,
+    KEY `zone_index` (`zone`),
+    KEY `host_index` (`host`),
+    KEY `type_index` (`type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+</code></pre>
+
+<div class="language-sql highlighter-rouge"><pre class="highlight"><code><span class="k">CREATE</span> <span class="k">TABLE</span> <span class="nv">`xfr_table`</span> <span class="p">(</span>
+    <span class="nv">`zone`</span> <span class="n">varchar</span><span class="p">(</span><span class="mi">255</span><span class="p">)</span> <span class="k">NOT</span> <span class="k">NULL</span><span class="p">,</span>
+    <span class="nv">`client`</span> <span class="n">varchar</span><span class="p">(</span><span class="mi">255</span><span class="p">)</span> <span class="k">NOT</span> <span class="k">NULL</span><span class="p">,</span>
+    <span class="k">KEY</span> <span class="nv">`zone_client_index`</span> <span class="p">(</span><span class="nv">`zone`</span><span class="p">(</span><span class="mi">30</span><span class="p">)),</span>
+    <span class="k">KEY</span> <span class="nv">`client_index`</span> <span class="p">(</span><span class="nv">`client`</span><span class="p">(</span><span class="mi">20</span><span class="p">))</span>
+<span class="p">)</span> <span class="n">ENGINE</span><span class="o">=</span><span class="n">InnoDB</span> <span class="k">DEFAULT</span> <span class="n">CHARSET</span><span class="o">=</span><span class="n">utf8</span><span class="p">;</span>
+</code></pre>
+</div>
+<p>其中<code class="highlighter-rouge">dns_records</code>表用于储存dns记录值，<code class="highlighter-rouge">xfr_table</code>是用来做DNS复制使用的。</p>
+
+<p>插入dns记录</p>
+
+<pre><code class="language-Sql">INSERT INTO `dns_records` VALUES
+('bindtest.example.com','@','SOA','bindtest.example.com.',300,NULL,120,900,604800,600,2018120210,'admin.bindtest.example.com.','ns1.bindtest.example.com.'),
+('bindtest.example.com','@','NS','ns1.bindtest.example.com.',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','@','NS','ns2.bindtest.example.com.',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','ns1','A','192.168.23.23',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','ns2','A','192.168.23.24',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+('bindtest.example.com','@','A','192.168.20.81',300,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+</code></pre>
+
+<p>需要注意的是NS记录的值为辅助dns的IP。</p>
+
+<pre><code class="language-Sql">INSERT INTO `xfr_table` VALUES
+('bindtest.example.com','192.168.23.23'),
+('bindtest.example.com','192.168.23.24');
+</code></pre>
+
+<p>需要将辅助DNS的IP插入到这张表中。</p>
+
+<p>3．配置bind</p>
+
+<p>我们编译的bind目录在<code class="highlighter-rouge">/usr/local/bind/</code>，配置文件位于<code class="highlighter-rouge">/usr/local/bind/etc</code> 。由于我们编译的bind并没有一些基础的配置，首先需要把yum源里面的bind的一些基础的配置和默认的zone配置拷贝到我们定义的目录中。</p>
+
+<pre><code class="language-Shell">cp /usr/share/doc/bind-9.9.4/sample/var/named/named.* /var/cache/named/
+cp /usr/share/doc/bind-9.9.4/sample/etc/named.rfc1912.zones /usr/local/bind/etc
+</code></pre>
+
+<p>编辑<code class="highlighter-rouge">usr/local/bind/etc/named.conf</code>：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>key "rndc-key" {
+	algorithm hmac-md5;
+	secret "0FpSonU53LYhtZGbpMhR8w==";
+};
+
+controls {
+	inet 127.0.0.1 port 953 allow { 127.0.0.1; } keys { "rndc-key"; };
+};
+
+statistics-channels {
+  	inet 127.0.0.1 port 8053 allow { 127.0.0.1; };
+};
+
+include "/usr/local/bind/etc/named.conf.options";
+include "/usr/local/bind/etc/named.conf.logging";
+include "/usr/local/bind/etc/bind.keys";
+
+zone "." IN {
+	type hint;
+	file "named.ca";
+};
+
+include "/usr/local/bind/etc/named.rfc1912.zones";
+include "/usr/local/bind/etc/named.dlz.zones";
+</code></pre>
+</div>
+
+<p>编辑<code class="highlighter-rouge">/usr/local/bind/etc/named.conf.options</code>：其中需要注意的是<code class="highlighter-rouge">also-notify</code>和<code class="highlighter-rouge">allow-transfer</code> 需要设置成辅助dns的IP。</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>options {
+  directory "/var/cache/bind";
+  zone-statistics yes;
+  statistics-file "/var/cache/bind/data/named-stats.out";
+  allow-query {
+	any;
+  };
+  allow-transfer {
+	192.168.23.23;
+	192.168.23.24;
+  };
+  notify yes;
+  also-notify {
+	192.168.23.23;
+	192.168.23.24;
+  };
+  recursion no;
+  pid-file "/run/named/named.pid";
+  session-keyfile "/run/named/session.key";
+  #forwarders {
+  #      192.168.1.1;
+  #      192.168.1.2;
+  #      192.168.1.3;
+  #};
+  #forward only;
+};
+</code></pre>
+</div>
+
+<p>编辑<code class="highlighter-rouge">/usr/local/bind/etc/named.conf.logging</code>：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>logging {
+	channel default-log {
+		file "data/default.log" versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel query-log {
+		file "data/query.log" versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel security-log {
+		file "data/security.log" versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel other-log {
+		file "data/other.log" versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	channel database-log {
+		file "data/database.log" versions 20 size 50m;
+		severity info;
+		print-severity yes;
+		print-time yes;
+		print-category yes;
+	};
+	category default {default-log;};
+	category queries { query-log;};
+	category security { security-log;};
+	category database { database-log;};
+	category lame-servers { null; };
+	category client { other-log;};
+	category config { other-log;};
+	category general { other-log;};
+};
+</code></pre>
+</div>
+
+<p>编辑<code class="highlighter-rouge">/usr/local/bind/etc/named.dlz.zones</code>:</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>dlz "Mysql zone" {
+   database "mysql
+   {host=192.168.20.67 port=3306 dbname=bind user=db_bind_app pass=****** ssl=false}
+   {select zone from dns_records where zone = '$zone$'}
+   {select ttl, type, mx_priority, case when lower(type)='txt' then concat('\"', data, '\"')
+        when lower(type) = 'soa' then concat_ws(' ', data, resp_person, serial, refresh, retry, expire, minimum)
+        else data end from dns_records where zone = '$zone$' and host = '$record$'}
+   {}
+   {select ttl, type, host, mx_priority, case when lower(type)='txt' then
+        concat('\"', data, '\"') else data end, resp_person, serial, refresh, retry, expire,
+        minimum from dns_records where zone = '$zone$'}
+   {select zone from xfr_table where zone = '$zone$' and client = '$client$'}";
+};
+</code></pre>
+</div>
+
+<p>在辅助dns上<code class="highlighter-rouge">/usr/local/bind/etc/named.dlz.zones</code>文件如下，我们将其配置成从主dns同步，需要将配置允许从主dns进行 notify和update。</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>zone "bindtest.example.com" IN {
+    type slave;
+    file "zone-from-mysql.db";
+    masters { 192.168.23.22; };
+    allow-update { 192.168.23.22; };
+    allow-notify {
+	192.168.23.22;
+	127.0.0.1;
+    };
+};
+</code></pre>
+</div>
+
+<p>编辑启动bind的systemd unit <code class="highlighter-rouge">/lib/systemd/system/named.service</code></p>
+
+<div class="language-shell highlighter-rouge"><pre class="highlight"><code><span class="o">[</span>Unit]
+<span class="nv">Description</span><span class="o">=</span>Bind DNS Server
+<span class="nv">After</span><span class="o">=</span>network.target
+
+<span class="o">[</span>Service]
+<span class="nv">Type</span><span class="o">=</span>forking
+<span class="nv">PIDFile</span><span class="o">=</span>/run/named/named.pid
+<span class="nv">ExecStart</span><span class="o">=</span>/usr/local/bind/sbin/named -c /usr/local/bind/etc/named.conf -u named
+
+<span class="o">[</span>Install]
+<span class="nv">WantedBy</span><span class="o">=</span>multi-user.target
+</code></pre>
+</div>
+
+<p>启动bind</p>
+
+<pre><code class="language-Shell">systemctl start named
+systemctl enable named
+</code></pre>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('基于mysql存储的DNS（bind）部署方案和步骤 —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

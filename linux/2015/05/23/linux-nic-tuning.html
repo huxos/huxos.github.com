@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>使用irq绑定＋rps 提升机器网络性能</title>
+    
+    <meta name="description" content="使用irq绑定＋rps 提升机器网络性能">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/linux/2015/05/23/linux-nic-tuning.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">使用irq绑定＋rps 提升机器网络性能</h1>
+<p class="post-meta">23 May 2015</p>
+
+<div class="posts">
+<h4 id="网卡软中断绑定irq设置">网卡软中断绑定irq设置</h4>
+
+<p>使用lspci -vvv 查看网卡时候支持多个收发队列，关键字为<code class="highlighter-rouge">MSI-X</code>，并且有Enable+。</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>...............
+Capabilities: [58] MSI: Enable- Count=1/16 Maskable- 64bit+
+    Address: 0000000000000000  Data: 0000
+Capabilities: [a0] MSI-X: Enable+ Count=9 Masked-
+    Vector table: BAR=0 offset=0000c000
+    PBA: BAR=0 offset=0000e000
+..................
+</code></pre>
+</div>
+
+<p>通过 <code class="highlighter-rouge">cat /proc/interrupts |grep eth0</code> 查看相应的网络中断号，对每一个中断号绑定到指定的CPU。</p>
+
+<h4 id="rps-设置">rps 设置</h4>
+
+<p>解决网卡队列数目和cpu核心数不一致的情况，通过配置<code class="highlighter-rouge">/sys/class/net/eth0/queues/rx-*/rps_cpus</code>对CPU进行绑定.</p>
+
+<h4 id="相关设置的脚本">相关设置的脚本</h4>
+
+<div class="language-python highlighter-rouge"><pre class="highlight"><code>  <span class="c">#!/usr/bin/env python</span>
+  <span class="c"># encoding: utf-8</span>
+
+  <span class="k">def</span> <span class="nf">smp_affinity</span><span class="p">():</span>
+
+      <span class="c">#每8位插入一个","</span>
+      <span class="k">def</span> <span class="nf">strConv</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+          <span class="kn">import</span> <span class="nn">re</span>
+          <span class="n">s</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">s</span><span class="p">)</span>
+          <span class="k">while</span> <span class="bp">True</span><span class="p">:</span>
+              <span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="n">count</span><span class="p">)</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">subn</span><span class="p">(</span><span class="s">r"(</span><span class="err">\</span><span class="s">w)(</span><span class="err">\</span><span class="s">w{8})((:?,</span><span class="err">\</span><span class="s">w{8})*)$"</span><span class="p">,</span> <span class="s">r"</span><span class="err">\</span><span class="s">1,</span><span class="err">\</span><span class="s">2</span><span class="err">\</span><span class="s">3"</span><span class="p">,</span> <span class="n">s</span><span class="p">)</span>
+              <span class="k">if</span> <span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                  <span class="k">break</span>
+          <span class="k">return</span> <span class="n">s</span>
+
+      <span class="kn">import</span> <span class="nn">re</span>
+      <span class="n">regex</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="nb">compile</span><span class="p">(</span><span class="s">r'(eth[0-9]-(tx|rx|txrx|fp|[-]?[0-9]))'</span><span class="p">,</span> <span class="n">re</span><span class="o">.</span><span class="n">IGNORECASE</span><span class="p">)</span>
+      <span class="n">num_cpus</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span>
+          <span class="nb">len</span><span class="p">([</span><span class="n">x</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="nb">open</span><span class="p">(</span><span class="s">'/proc/cpuinfo'</span><span class="p">)</span> <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s">'processor'</span><span class="p">)]))</span>
+      <span class="n">net_dev_list</span> <span class="o">=</span> <span class="p">[</span><span class="n">x</span><span class="o">.</span><span class="n">split</span><span class="p">()[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+                      <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="nb">open</span><span class="p">(</span><span class="s">'/proc/interrupts'</span><span class="p">)</span> <span class="k">if</span> <span class="s">'eth'</span> <span class="ow">in</span> <span class="n">x</span><span class="p">]</span>
+      <span class="n">net_dev_irq</span> <span class="o">=</span> <span class="p">[</span><span class="n">x</span><span class="o">.</span><span class="n">split</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s">':'</span><span class="p">)</span>
+                     <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="nb">open</span><span class="p">(</span><span class="s">'/proc/interrupts'</span><span class="p">)</span> <span class="k">if</span> <span class="s">'eth'</span> <span class="ow">in</span> <span class="n">x</span><span class="p">]</span>
+
+      <span class="k">if</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">regex</span><span class="p">,</span> <span class="s">','</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">net_dev_list</span><span class="p">)):</span>
+          <span class="n">smp_affinity</span> <span class="o">=</span> <span class="p">[</span><span class="s">'/proc/irq/</span><span class="si">%</span><span class="s">s/smp_affinity'</span> <span class="o">%</span> <span class="n">x</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">net_dev_irq</span><span class="p">]</span>
+          <span class="n">bit_cpus</span> <span class="o">=</span> <span class="p">[</span><span class="n">strConv</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="nb">hex</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">x</span><span class="p">))</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s">'0x'</span><span class="p">,</span> <span class="s">''</span><span class="p">))</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span>
+              <span class="n">num_cpus</span><span class="p">)][::</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">net_dev_irq</span><span class="p">)</span> <span class="o">/</span> <span class="n">num_cpus</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+      <span class="k">else</span><span class="p">:</span>
+          <span class="n">smp_affinity</span> <span class="o">=</span> <span class="p">[</span><span class="s">'/proc/irq/</span><span class="si">%</span><span class="s">s/smp_affinity'</span> <span class="o">%</span> <span class="n">x</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">net_dev_irq</span><span class="p">]</span>
+          <span class="n">bit_cpus</span> <span class="o">=</span> <span class="p">[</span>
+              <span class="n">strConv</span><span class="p">(</span><span class="nb">hex</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="s">'1'</span> <span class="o">*</span> <span class="n">num_cpus</span><span class="p">,</span> <span class="mi">2</span><span class="p">))</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s">'0x'</span><span class="p">,</span> <span class="s">''</span><span class="p">))]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">smp_affinity</span><span class="p">)</span>
+
+      <span class="n">smp_affinity_list</span> <span class="o">=</span> <span class="nb">zip</span><span class="p">(</span><span class="n">bit_cpus</span><span class="p">,</span> <span class="n">smp_affinity</span><span class="p">)</span>
+
+      <span class="n">active_nics</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">([</span><span class="n">x</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s">'-'</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">net_dev_list</span><span class="p">]))</span>
+      <span class="k">if</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">active_nics</span><span class="p">)):</span>
+          <span class="kn">from</span> <span class="nn">glob</span> <span class="kn">import</span> <span class="n">glob</span>
+          <span class="n">rps_flow_cnt</span> <span class="o">=</span> <span class="mi">0</span>
+          <span class="k">for</span> <span class="n">nic</span> <span class="ow">in</span> <span class="n">active_nics</span><span class="p">:</span>
+              <span class="n">rps</span> <span class="o">=</span> <span class="n">glob</span><span class="p">(</span><span class="s">'/sys/class/net/</span><span class="si">%</span><span class="s">s/queues/rx-*/rps_cpus'</span> <span class="o">%</span> <span class="n">nic</span><span class="p">)</span>
+              <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rps</span><span class="p">):</span>
+                  <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rps</span><span class="p">)</span> <span class="o">!=</span> <span class="n">num_cpus</span><span class="p">:</span>
+                      <span class="n">bit_cpus</span> <span class="o">=</span> <span class="p">[</span>
+                          <span class="n">strConv</span><span class="p">(</span><span class="nb">hex</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="s">'1'</span> <span class="o">*</span> <span class="n">num_cpus</span><span class="p">,</span> <span class="mi">2</span><span class="p">))</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s">'0x'</span><span class="p">,</span> <span class="s">''</span><span class="p">))]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">rps</span><span class="p">)</span>
+                      <span class="n">smp_affinity_list</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span>
+                          <span class="nb">zip</span><span class="p">([</span><span class="mi">4096</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">rps</span><span class="p">),</span> <span class="p">[</span><span class="n">x</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s">'rps_cpus'</span><span class="p">,</span> <span class="s">'rps_flow_cnt'</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">rps</span><span class="p">]))</span>
+                      <span class="n">rps_flow_cnt</span> <span class="o">=</span> <span class="n">rps_flow_cnt</span> <span class="o">+</span> <span class="mi">4096</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">rps</span><span class="p">)</span>
+                  <span class="k">else</span><span class="p">:</span>
+                      <span class="n">bit_cpus</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">rps</span><span class="p">)</span>
+                  <span class="n">smp_affinity_list</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">bit_cpus</span><span class="p">,</span> <span class="n">rps</span><span class="p">))</span>
+              <span class="n">xps</span> <span class="o">=</span> <span class="n">glob</span><span class="p">(</span><span class="s">'/sys/class/net/</span><span class="si">%</span><span class="s">s/queues/tx-*/xps_cpus'</span> <span class="o">%</span> <span class="n">nic</span><span class="p">)</span>
+              <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">xps</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">num_cpus</span><span class="p">:</span>
+                  <span class="n">bit_cpus</span> <span class="o">=</span> <span class="p">[</span>
+                      <span class="n">strConv</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="nb">hex</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">x</span><span class="p">))</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s">'0x'</span><span class="p">,</span> <span class="s">''</span><span class="p">))</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_cpus</span><span class="p">)][::</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+                  <span class="n">smp_affinity_list</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">bit_cpus</span><span class="p">,</span> <span class="n">rps</span><span class="p">))</span>
+
+              <span class="k">print</span> <span class="s">'ethtool -C </span><span class="si">%</span><span class="s">s  rx-usecs 333'</span> <span class="o">%</span> <span class="n">nic</span>
+
+          <span class="k">if</span> <span class="n">rps_flow_cnt</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+              <span class="n">smp_affinity_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                  <span class="p">(</span><span class="n">rps_flow_cnt</span><span class="p">,</span> <span class="s">'/proc/sys/net/core/rps_sock_flow_entries'</span><span class="p">))</span>
+
+      <span class="k">for</span> <span class="n">smp</span> <span class="ow">in</span> <span class="n">smp_affinity_list</span><span class="p">:</span>
+          <span class="k">print</span> <span class="s">'echo </span><span class="si">%</span><span class="s">s &gt; </span><span class="si">%</span><span class="s">s'</span> <span class="o">%</span> <span class="p">(</span><span class="n">smp</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">smp</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+
+  <span class="k">if</span> <span class="n">__name__</span> <span class="o">==</span> <span class="s">'__main__'</span><span class="p">:</span>
+      <span class="n">smp_affinity</span><span class="p">()</span>
+</code></pre>
+</div>
+
+<h4 id="参考连接">参考连接</h4>
+
+<ol>
+  <li><a href="https://github.com/fastos/fastsocket/blob/master/scripts/nic.sh">https://github.com/fastos/fastsocket/blob/master/scripts/nic.sh</a></li>
+  <li><a href="https://access.redhat.com/documentation/zh-CN/Red_Hat_Enterprise_Linux/7/html/Performance_Tuning_Guide/sect-Red_Hat_Enterprise_Linux-Performance_Tuning_Guide-Networking-Configuration_tools.html#sect-Red_Hat_Enterprise_Linux-Performance_Tuning_Guide-Configuration_tools-Configuring_Receive_Packet_Steering_RPS">Red Hat Customer Portal</a></li>
+</ol>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('使用irq绑定＋rps 提升机器网络性能 —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>

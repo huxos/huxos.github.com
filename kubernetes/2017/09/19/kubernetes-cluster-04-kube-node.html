@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>kubernetes集群搭建（4. kube node）</title>
+    
+    <meta name="description" content="kubernetes集群搭建">
+    
+    <meta name="author" content="Huxos">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="author" href="//huxos.me">
+    <link href="http://localhost:4000/kubernetes/2017/09/19/kubernetes-cluster-04-kube-node.html" rel="canonical">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="alternate" type="application/rss+xml" title="Huxos" href="http://localhost:4000/feed.xml">
+    <link rel="stylesheet" href="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.css">
+    <link type="text/css" rel="stylesheet" href="/assets/application.css">
+    <script src="//libs.baidu.com/jquery/1.11.1/jquery.min.js"></script>
+    <script src="//cdn.staticfile.org/fluidbox/1.3.1/jquery.fluidbox.min.js"></script>
+    <script async="" src="//www.google-analytics.com/analytics.js"></script>
+  </head>
+
+  <body>
+  <header class="site-header" role="banner">
+      <div class="container">
+        <a href="/" class="logo"><img src="/assets/logo.png" alt="Huxos" class="site-logo"></a>
+        <nav role="navigiation">
+          <ul class="site-nav">
+            <li><a href="/about/">About</a>
+            <li><a href="/blog/">Blog</a>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    
+
+    <div class="site-content">
+      <div class="container">
+        <h1 class="post-title">kubernetes集群搭建（4. kube node）</h1>
+<p class="post-meta">19 Sep 2017</p>
+
+<div class="posts">
+<p>本例Kube Node节点的kubelet通过VIP 10.22.108.250与APIServer通讯。kubelet第一次通过启动tls bootstrap认证后，由apiserver生成节点的证书。</p>
+
+<h4 id="部署步骤">部署步骤</h4>
+
+<ol>
+  <li>
+    <p>网络组建部署</p>
+
+    <p>参照上篇<a href="http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html">kubernetes集群搭建（3. Kube master）</a> 配置好flanneld 以及CNI</p>
+  </li>
+  <li>
+    <p>部署kubelet</p>
+
+    <ol>
+      <li>
+        <p>生成kubectl获取认证的bootstrap-kubeconfig</p>
+
+        <p>使用如下命令生成<code class="highlighter-rouge">bootstrap-kubeconfig.yaml</code></p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code>kubectl config set-cluster kubernetes \
+    --certificate-authority=cert/ca.pem \
+    --embed-certs=true \
+    --server=http://10.22.108.250:6443 \
+    --kubeconfig=bootstrap-kubeconfig.yaml
+
+kubectl config set-credentials kubelet-bootstrap \
+    --token=${BOOTSTRAP} \
+    --kubeconfig=bootstrap-kubeconfig.yaml
+
+kubectl config set-context default \
+    --cluster=kubernetes \
+    --user=kubelet-bootstrap \
+    --kubeconfig=bootstrap-kubeconfig.yaml
+
+kubectl config use-context default --kubeconfig=bootstrap-kubeconfig.yaml
+</code></pre>
+        </div>
+
+        <p><code class="highlighter-rouge">--embed-certs=true</code> 选项可以让生成的证书.pem 文件内嵌到yaml文件中，简化配置文件。
+生成bootstrap-kubeconfig.yaml之后传输到node节点上，放到<code class="highlighter-rouge">/ete/kubernetes/</code> 目录中。</p>
+      </li>
+      <li>
+        <p>下载kubelet</p>
+
+        <p>到node节点，使用下面的命令下载kubelet</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> wegt https://storage.googleapis.com/kubernetes-release/release/v1.7.3/bin/linux/amd64/kubelet -O /opt/bin/kubelet &amp;&amp; \
+ chmod +x /opt/bin/kubelet
+</code></pre>
+        </div>
+      </li>
+      <li>
+        <p>配置 kubelet 启动的systemd unit</p>
+
+        <p>编辑<code class="highlighter-rouge">/lib/systemd/system/kubelet.service</code>:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code> [Service]
+ ExecStartPre=/bin/mkdir -p /etc/kubernetes/manifests
+ ExecStart=/opt/bin/kubelet \
+   --require-kubeconfig \
+   --experimental-bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubeconfig.yaml \
+   --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+   --cert-dir=/etc/kubernetes/ssl \
+   --container-runtime=docker \
+   --docker=unix:///var/run/docker.sock \
+   --network-plugin=cni \
+   --allow-privileged=true \
+   --pod-manifest-path=/etc/kubernetes/manifests \
+   --hostname-override=10.22.108.80 \
+   --cluster-dns=10.99.66.2 \
+   --cluster-domain=cluster.local \
+   --max-pods=32 \
+   --serialize-image-pulls=false \
+   --pod-infra-container-image=gcr.io/google_containers/pause-amd64:3.0
+ Restart=always
+ RestartSec=10
+
+ [Install]
+ WantedBy=multi-user.target
+</code></pre>
+        </div>
+
+        <ul>
+          <li>
+            <p><code class="highlighter-rouge">--hostname-override=10.22.108.80 </code> 此处更改为node节点的IP</p>
+          </li>
+          <li>
+            <p><code class="highlighter-rouge">--kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml --cert-dir=/etc/kubernetes/ssl</code>
+ kubelet认证成功之后将会生成/etc/kubernetes/worker-kubeconfig.yaml， 并且在/etc/kubernetes/ssl 目录下面生成证书。</p>
+          </li>
+          <li>
+            <p>使用<code class="highlighter-rouge">systemctl enable  kubelet &amp;&amp; systemctl start kubelet</code> 启动kubelet。</p>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <p>通过 kubelet 的证书请求</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code># kubectl get csr
+NAME                                                   AGE       REQUESTOR           CONDITION
+node-csr-K9fSKHorWHsmTl4X7iApDB5DPAEEidAnmt93ia8Aydk   2m       kubelet-bootstrap   Pending
+# kubectl certificate approve node-csr-K9fSKHorWHsmTl4X7iApDB5DPAEEidAnmt93ia8Aydk
+# kubectl get node
+</code></pre>
+        </div>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>部署kube-proxy</p>
+
+    <ol>
+      <li>
+        <p>生成kube-proxy使用的kubeconfig</p>
+
+        <p>上篇<a href="http://huxos.me/kubernetes/2017/09/19/kubernetes-cluster-03-kube-master.html">kubernetes集群搭建（3. Kube master）</a> 生成了kube-proxy所使用的证书文件，现在利用证书生成proxy-kubeconfig.yaml。</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code>kubectl config set-cluster kubernetes \
+    --certificate-authority=cert/ca.pem \
+    --embed-certs=true \
+    --server=https://10.22.108.250:6443
+    --kubeconfig=proxy-kubeconfig.yaml
+
+kubectl config set-credentials proxy \
+    --client-certificate=cert/proxy.pem \
+    --client-key=cert/proxy-key.pem \
+    --embed-certs=true
+    --kubeconfig=proxy-kubeconfig.yaml
+
+kubectl config set-context default \
+    --cluster=kubernetes \
+    --user=porxy
+    --kubeconfig=proxy-kubeconfig.yaml
+
+kubectl config use-context default --kubeconfig=proxy-kubeconfig.yaml
+</code></pre>
+        </div>
+        <p>将proxy-kubeconfig.yaml 拷贝到node节点的<code class="highlighter-rouge">/etc/kubernetes/</code>目录下。</p>
+      </li>
+      <li>
+        <p>配置kube-proxy启动的static pod</p>
+
+        <p>编辑<code class="highlighter-rouge">/etc/kubernetes/manifests/kube-proxy.yaml</code>:</p>
+
+        <div class="highlighter-rouge"><pre class="highlight"><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+spec:
+  hostNetwork: true
+  containers:
+  - name: kube-proxy
+    image: quay.io/coreos/hyperkube:v1.7.3_coreos.0
+    command:
+    - /hyperkube
+    - proxy
+    - --hostname-override=10.22.108.80
+    - --cluster-cidr=10.99.66.0/23
+    - --kubeconfig=/etc/kubernetes/proxy-kubeconfig.yaml
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - mountPath: /etc/ssl/certs
+      name: ssl-certs-host
+      readOnly: true
+    - mountPath: /etc/kubernetes/proxy-kubeconfig.yaml
+      name: proxy-kubeconfig
+  volumes:
+  - hostPath:
+      path: /usr/share/ca-certificates
+    name: ssl-certs-host
+  - hostPath:
+      path: /etc/kubernetes/proxy-kubeconfig.yaml
+    name: proxy-kubeconfig
+</code></pre>
+        </div>
+
+        <p><code class="highlighter-rouge">--hostname-override=10.22.108.80</code> 此处需要修改成节点的IP，由于POD需要操作iptables 所以需要：<code class="highlighter-rouge">privileged: true</code> 。</p>
+      </li>
+    </ol>
+  </li>
+</ol>
+
+<p>至此kube node节点就部署完成了。</p>
+
+</div>
+
+<div class="post-comments">
+    <a href="javascript:;" onclick='share_to_weibo()'>
+        <i class="icon-weibo"></i>分享到微博</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  指正、疑问、评论可通过<a href="http://weibo.com/weihy511" rel="nofollow">Weibo(@PACMAN_)</a>联系我。
+</div>
+
+<script>
+    function share_to_weibo(){
+      location.href="http://service.weibo.com/share/share.php?title="+encodeURIComponent('kubernetes集群搭建（4. kube node） —— http://huxos.me')+"&url="+encodeURIComponent(location.href);
+    }
+</script>
+
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="container">
+        © Huxos 2014.
+        <br>
+        liberty, when it begins to take root, it a plant of rapid growth.
+        <br>
+        Powered By Jekyll on Github, Forked from <a href="https://github.com/RichGuk/richguk.github.io">RichGuk</a>.
+      </div>
+    </footer>
+    <script>
+      (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+          m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+      })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+      ga('create', 'UA-36713694-1', 'huxos.me');
+      ga('send', 'pageview');
+      $(function() {
+        $('a[data-fluidbox]').fluidbox();
+      });
+    </script>
+  </body>
+</html>
